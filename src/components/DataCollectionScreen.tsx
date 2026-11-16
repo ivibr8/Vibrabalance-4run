@@ -21,6 +21,103 @@ import {
   Square,
 } from 'lucide-react';
 
+interface NumericInputProps {
+  id?: string;
+  value: number;
+  onChangeValue: (val: number) => void;
+  allowDecimal?: boolean;
+  min?: number;
+  max?: number;
+  fallbackOnEmpty?: number | null;
+  placeholder?: string;
+  className?: string;
+}
+
+const NumericInput: React.FC<NumericInputProps> = ({
+  id,
+  value,
+  onChangeValue,
+  allowDecimal = false,
+  min,
+  max,
+  fallbackOnEmpty = null,
+  placeholder,
+  className,
+}) => {
+  const formatVal = (v: number) =>
+    v === 0 && fallbackOnEmpty === null ? '' : String(v);
+
+  const [draft, setDraft] = useState<string>(() => formatVal(value));
+  const [isFocused, setIsFocused] = useState(false);
+
+  useEffect(() => {
+    if (!isFocused) {
+      setDraft(formatVal(value));
+    }
+  }, [value, isFocused, fallbackOnEmpty]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    const cleaned = allowDecimal
+      ? raw.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1')
+      : raw.replace(/[^0-9]/g, '');
+    setDraft(cleaned);
+
+    if (cleaned === '' || cleaned === '.') {
+      if (fallbackOnEmpty === null) {
+        onChangeValue(0);
+      }
+      return;
+    }
+
+    const parsed = allowDecimal ? parseFloat(cleaned) : parseInt(cleaned, 10);
+    if (Number.isFinite(parsed)) {
+      onChangeValue(max !== undefined && parsed > max ? max : parsed);
+    }
+  };
+
+  const handleBlur = () => {
+    setIsFocused(false);
+    if (draft === '' || draft === '.') {
+      if (fallbackOnEmpty === null) {
+        setDraft('');
+        onChangeValue(0);
+      } else {
+        setDraft(String(fallbackOnEmpty));
+        onChangeValue(fallbackOnEmpty);
+      }
+      return;
+    }
+
+    let parsed = allowDecimal ? parseFloat(draft) : parseInt(draft, 10);
+    if (!Number.isFinite(parsed)) {
+      const fb = fallbackOnEmpty ?? 0;
+      setDraft(fallbackOnEmpty === null && fb === 0 ? '' : String(fb));
+      onChangeValue(fb);
+      return;
+    }
+
+    if (min !== undefined && parsed < min) parsed = min;
+    if (max !== undefined && parsed > max) parsed = max;
+    setDraft(parsed === 0 && fallbackOnEmpty === null ? '' : String(parsed));
+    onChangeValue(parsed);
+  };
+
+  return (
+    <input
+      id={id}
+      type="text"
+      inputMode={allowDecimal ? 'decimal' : 'numeric'}
+      value={draft}
+      placeholder={placeholder}
+      onFocus={() => setIsFocused(true)}
+      onChange={handleChange}
+      onBlur={handleBlur}
+      className={className}
+    />
+  );
+};
+
 interface Props {
   run: RunData;
   runIndex: number;
@@ -194,7 +291,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
   return (
     <div className="max-w-4xl mx-auto space-y-4 py-1">
       {/* Run Title & Axis / Phase Bar */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 space-y-3">
+      <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-4 sm:p-5 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-xs font-mono text-slate-500">
@@ -207,7 +304,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
 
           <div className="flex flex-wrap items-center gap-3">
             {/* Axis Selector */}
-            <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl p-1 text-xs">
+            <div className="flex items-center gap-1.5 bg-slate-100 border border-slate-300 rounded-xl p-1 text-xs">
               <span className="text-slate-500 font-medium px-2">Axis:</span>
               {axisChoices.map((ax) => {
                 const active = config.sensorAxis === ax.id;
@@ -235,14 +332,15 @@ export const DataCollectionScreen: React.FC<Props> = ({
             </div>
 
             {run.type !== 'O' && (
-              <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 text-xs">
+              <div className="flex items-center gap-1.5 bg-slate-100 border border-slate-300 rounded-xl px-3 py-1.5 text-xs">
                 <span className="text-slate-600 font-medium">Phase:</span>
-                <input
-                  type="number"
-                  min="0"
-                  max="359"
+                <NumericInput
                   value={run.phaseAngleDeg}
-                  onChange={(e) => onUpdatePhaseAngle(parseInt(e.target.value, 10) || 0)}
+                  min={0}
+                  max={359}
+                  fallbackOnEmpty={0}
+                  placeholder="0"
+                  onChangeValue={onUpdatePhaseAngle}
                   className="w-14 bg-white border border-slate-300 rounded-md px-1.5 py-1 text-center font-mono font-bold text-slate-900 text-xs focus:outline-none focus:border-cyan-600"
                 />
                 <span className="text-slate-500">°</span>
@@ -253,7 +351,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
       </div>
 
       {/* Peak-Hold Live Spectrum Card */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 space-y-4">
+      <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-4 sm:p-5 space-y-4">
         {/* Top Action Controls */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -325,13 +423,11 @@ export const DataCollectionScreen: React.FC<Props> = ({
             </label>
             <input
               id="ref-rpm-input"
-              type="number"
-              min="60"
-              max="15000"
-              step="10"
+              type="text"
+              inputMode="numeric"
               placeholder="e.g. 2580"
               value={optionalRpm}
-              onChange={(e) => setOptionalRpm(e.target.value)}
+              onChange={(e) => setOptionalRpm(e.target.value.replace(/[^0-9]/g, ''))}
               className="w-24 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1.5 text-right font-mono font-semibold text-slate-900 text-xs focus:bg-white focus:outline-none focus:border-cyan-600"
             />
             {refFreqHz !== null && (
@@ -370,7 +466,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
         )}
 
         {/* Spectrum SVG Display */}
-        <div className="w-full bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="w-full bg-white border border-slate-300 rounded-xl overflow-hidden">
           {!peakHold || visibleIndices.length < 2 ? (
             <div className="h-72 sm:h-80 flex flex-col items-center justify-center p-6 text-center space-y-2 text-slate-500">
               <Activity
@@ -664,7 +760,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
         )}
 
         {/* Selected Held Peak Readout & Accept Button */}
-        <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+        <div className="bg-slate-100 border border-slate-300 rounded-xl p-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
               <Crosshair className="w-4 h-4 text-amber-600" />
@@ -732,7 +828,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
       </div>
 
       {/* Saved / Manual Override Row */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="space-y-0.5">
           <span className="text-xs font-bold text-slate-800 block">
             Accepted Run Value / Manual Override (AU)
@@ -743,13 +839,13 @@ export const DataCollectionScreen: React.FC<Props> = ({
         </div>
 
         <div className="flex items-center gap-2 sm:w-56">
-          <input
-            type="number"
-            step="0.001"
-            min="0"
-            value={run.amplitudeMils > 0 ? run.amplitudeMils : ''}
-            onChange={(e) => onUpdateManualAmp(parseFloat(e.target.value) || 0)}
+          <NumericInput
+            value={run.amplitudeMils}
+            allowDecimal
+            min={0}
+            fallbackOnEmpty={null}
             placeholder="0.000"
+            onChangeValue={onUpdateManualAmp}
             className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-right font-mono tabular-nums text-base font-bold text-slate-900 focus:bg-white focus:outline-none focus:border-cyan-600"
           />
           <span className="text-xs font-mono font-semibold text-slate-600 whitespace-nowrap">

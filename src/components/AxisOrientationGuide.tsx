@@ -43,7 +43,7 @@ export const AxisOrientationGuide: React.FC<Props> = ({
   ];
 
   return (
-    <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+    <div className="bg-slate-100 border border-slate-300 rounded-xl p-4 space-y-3">
       <div className="flex flex-col sm:flex-row items-center gap-5">
         {/* W3C / Android / iOS 3-Axis Coordinate Diagram */}
         <div className="shrink-0 flex flex-col items-center">
