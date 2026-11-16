@@ -169,7 +169,10 @@ export default function App() {
         }
       },
       onStatusChange: (status, message) => {
-        if (status === 'error' && message) {
+        if (status === 'streaming') {
+          isStreamingRef.current = true;
+          setIsStreaming(true);
+        } else if (status === 'error' && message) {
           isStreamingRef.current = false;
           setStreamError(message);
           setIsStreaming(false);
