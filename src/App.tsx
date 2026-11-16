@@ -327,9 +327,9 @@ export default function App() {
   ];
 
   return (
-    <div className="min-h-screen bg-slate-100 text-slate-900 flex flex-col font-sans">
+    <div className="min-h-screen bg-slate-300/80 text-slate-900 flex flex-col font-sans">
       {/* Top Bar */}
-      <header className="sticky top-0 z-40 bg-white border-b border-slate-200 px-4 md:px-8 py-3 flex items-center justify-between gap-6 shrink-0">
+      <header className="sticky top-0 z-40 bg-white border-b border-slate-300 shadow-xs px-4 md:px-8 py-3 flex items-center justify-between gap-6 shrink-0">
         <button
           type="button"
           onClick={() => navigateToScreen(0)}
@@ -369,7 +369,7 @@ export default function App() {
       </header>
 
       {/* Mobile Compact Step Switcher */}
-      <div className="md:hidden bg-white border-b border-slate-200 px-4 py-2 flex items-center justify-between text-xs font-mono">
+      <div className="md:hidden bg-white border-b border-slate-300 px-4 py-2 flex items-center justify-between text-xs font-mono">
         <span className="text-slate-700 font-semibold">
           {screenSteps[currentScreen].label} ({currentScreen + 1}/6)
         </span>
@@ -384,7 +384,7 @@ export default function App() {
                   ? 'bg-slate-900 text-white'
                   : s.id > 0 && runs[s.id - 1]?.isKept
                   ? 'bg-emerald-100 text-emerald-800'
-                  : 'bg-slate-100 text-slate-600'
+                  : 'bg-slate-200 text-slate-700'
               }`}
             >
               {s.id + 1}
@@ -394,7 +394,7 @@ export default function App() {
       </div>
 
       {/* Unboxed Summary Strip */}
-      <div className="bg-slate-50 border-b border-slate-200 px-4 md:px-8 py-2 flex flex-wrap items-center justify-between gap-2 text-xs font-mono tabular-nums text-slate-600">
+      <div className="bg-slate-200 border-b border-slate-300 px-4 md:px-8 py-2 flex flex-wrap items-center justify-between gap-2 text-xs font-mono tabular-nums text-slate-700">
         <div>
           O: <strong className="text-slate-900">{runs[0].amplitudeMils}</strong>
           {' · '}O+T1: <strong className="text-slate-900">{runs[1].amplitudeMils}</strong>
@@ -484,7 +484,7 @@ export default function App() {
       </main>
 
       {/* Clean Footer */}
-      <footer className="border-t border-slate-200 bg-white px-6 py-3.5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500 shrink-0">
+      <footer className="border-t border-slate-300 bg-white px-6 py-3.5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600 shrink-0">
         <span>VibraBalance 4-Run · Peak-Hold Smartphone FFT Balancing (AU)</span>
         <button
           type="button"
