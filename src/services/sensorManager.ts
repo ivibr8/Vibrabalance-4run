@@ -86,7 +86,7 @@ export class SensorManager {
     runType: 'O' | 'O+T1' | 'O+T2' | 'O+T3';
     baseRpm: number;
   }): void {
-    this.stopLiveStream();
+    this.cleanupHardware();
 
     this.samples = [];
     this.isStreaming = true;
@@ -259,7 +259,7 @@ export class SensorManager {
     }, 110);
   }
 
-  public stopLiveStream(): void {
+  private cleanupHardware(): void {
     this.isStreaming = false;
     if (this.probeTimer !== null) {
       window.clearTimeout(this.probeTimer);
@@ -285,6 +285,10 @@ export class SensorManager {
       }
       this.genericSensor = null;
     }
+  }
+
+  public stopLiveStream(): void {
+    this.cleanupHardware();
     this.callbacks.onStatusChange?.('idle');
   }
 
