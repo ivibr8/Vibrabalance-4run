@@ -279,3 +279,81 @@ export function updateSpectrumMeasurement(
   };
 }
 
+/**
+ * Parses an exported Phyphox FFT / Acceleration Spectrum CSV ("Frequency (Hz)","Absolute Amplitude (a.u.)")
+ * supporting comma, semicolon, or tab delimiters and scientific notation.
+ */
+export function parsePhyphoxCsv(csvText: string): SpectrumMeasurement | null {
+  const lines = csvText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const pairs: { f: number; a: number }[] = [];
+
+  for (const line of lines) {
+    // Support comma, semicolon, or tab separation
+    const sep = line.includes('\t') ? '\t' : line.includes(';') && !line.includes(',') ? ';' : ',';
+    const parts = line.split(sep).map((p) => p.replace(/^["'\s]+|["'\s]+$/g, ''));
+    if (parts.length < 2) continue;
+
+    const f = Number(parts[0]);
+    const a = Number(parts[1]);
+    if (Number.isFinite(f) && Number.isFinite(a) && f >= 0 && a >= 0) {
+      pairs.push({ f, a });
+    }
+  }
+
+  if (pairs.length < 4) return null;
+
+  pairs.sort((p1, p2) => p1.f - p2.f);
+
+  const diffs: number[] = [];
+  for (let i = 1; i < pairs.length; i++) {
+    const d = pairs[i].f - pairs[i - 1].f;
+    if (d > 1e-4) diffs.push(d);
+  }
+  if (diffs.length === 0) return null;
+  diffs.sort((a, b) => a - b);
+  const df = diffs[Math.floor(diffs.length / 2)];
+
+  const frequenciesHz: number[] = [];
+  const amplitudesAU: number[] = [];
+
+  // Phyphox exports start at bin k=1 (df); prepend DC 0 Hz = 0 for clean plotting from origin
+  if (pairs[0].f > df * 0.5) {
+    frequenciesHz.push(0);
+    amplitudesAU.push(0);
+  }
+  for (const p of pairs) {
+    frequenciesHz.push(p.f);
+    amplitudesAU.push(p.a);
+  }
+
+  const fLast = pairs[pairs.length - 1].f;
+  const lastBinIndex = Math.round(fLast / df);
+  const nextPow2 = Math.pow(2, Math.ceil(Math.log2(Math.max(2, lastBinIndex + 1))));
+  // Phyphox omits DC (k=0) and Nyquist (k=N/2); e.g. 63 bins => N/2 = 64 => Nyquist = 64 * df
+  const nyquistHz = Math.abs(lastBinIndex + 1 - nextPow2) <= 1 ? nextPow2 * df : fLast;
+  const sampleRateHz = 2 * nyquistHz;
+  const resolutionHz = df;
+  const periodSec = 1 / df;
+  const samplesUsed = Math.max(pairs.length * 2, Math.round(sampleRateHz / df));
+
+  return {
+    frequenciesHz,
+    amplitudesAU,
+    liveAmplitudesAU: amplitudesAU,
+    sampleRateHz,
+    nyquistHz,
+    resolutionHz,
+    periodSec,
+    samplesUsed,
+    fftSize: samplesUsed,
+    sensorSource: 'Phyphox CSV',
+    axisUsed: 'triaxial',
+    frameCount: 1,
+  };
+}
+
+
