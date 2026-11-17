@@ -2,13 +2,18 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   BalancingCalculationResult,
   BalancingConfig,
-  PeakHoldSpectrum,
+  BufferProgress,
   RunData,
   RunType,
   SensorAxis,
+  SpectrumMeasurement,
   VibrationSample,
 } from './types/balancing';
-import { computeLiveSpectrumFrame, updatePeakHoldSpectrum } from './utils/fft';
+import {
+  computeBufferProgress,
+  computeLiveSpectrumFrame,
+  updateSpectrumMeasurement,
+} from './utils/fft';
 import { solveFourRunNoPhase } from './utils/balancingSolver';
 import { SensorManager } from './services/sensorManager';
 import { MethodologyScreen } from './components/MethodologyScreen';
@@ -129,9 +134,10 @@ export default function App() {
   const [isSimulatorMode, setIsSimulatorMode] = useState<boolean>(false);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [streamError, setStreamError] = useState<string | null>(null);
-  const [peakHoldByRun, setPeakHoldByRun] = useState<{
-    [key in RunType]?: PeakHoldSpectrum | null;
+  const [spectrumByRun, setSpectrumByRun] = useState<{
+    [key in RunType]?: SpectrumMeasurement | null;
   }>({});
+  const [bufferProgress, setBufferProgress] = useState<BufferProgress | null>(null);
   const [lastSampleRate, setLastSampleRate] = useState<number>(60);
   const [isInstallModalOpen, setIsInstallModalOpen] = useState<boolean>(false);
 
@@ -154,6 +160,12 @@ export default function App() {
     sensorManagerRef.current = new SensorManager({
       onSamplesBuffer: (samples: VibrationSample[], sourceLabel: string) => {
         if (!isStreamingRef.current) return;
+        const progress = computeBufferProgress(samples, sourceLabel);
+        setBufferProgress(progress);
+        if (progress.estimatedRateHz) {
+          setLastSampleRate(Math.round(progress.estimatedRateHz));
+        }
+
         const frame = computeLiveSpectrumFrame(
           samples,
           activeAxisRef.current,
@@ -162,9 +174,9 @@ export default function App() {
         if (frame) {
           const runType = activeRunRef.current;
           setLastSampleRate(Math.round(frame.sampleRateHz));
-          setPeakHoldByRun((prev) => ({
+          setSpectrumByRun((prev) => ({
             ...prev,
-            [runType]: updatePeakHoldSpectrum(prev[runType] || null, frame),
+            [runType]: updateSpectrumMeasurement(prev[runType] || null, frame),
           }));
         }
       },
@@ -202,6 +214,7 @@ export default function App() {
   const navigateToScreen = (screenId: number) => {
     if (isStreaming) stopLiveStream();
     setStreamError(null);
+    setBufferProgress(null);
     setCurrentScreen(screenId);
   };
 
@@ -211,11 +224,20 @@ export default function App() {
 
     setStreamError(null);
     activeRunRef.current = runType;
+    setBufferProgress({
+      collected: 0,
+      target: 1024,
+      estimatedRateHz: null,
+      sensorSource: isSimulatorMode ? 'Simulator (411 Hz)' : 'Sensor',
+    });
 
     // Must be called directly inside user tap handler on iOS Safari
     if (!isSimulatorMode && mgr.isPermissionRequired()) {
       const granted = await mgr.requestPermission();
-      if (!granted) return;
+      if (!granted) {
+        setBufferProgress(null);
+        return;
+      }
     }
 
     isStreamingRef.current = true;
@@ -225,9 +247,10 @@ export default function App() {
     );
   };
 
-  const handleClearPeakHold = (runType: RunType) => {
+  const handleClearSpectrum = (runType: RunType) => {
     sensorManagerRef.current?.clearSamples();
-    setPeakHoldByRun((prev) => ({ ...prev, [runType]: null }));
+    setBufferProgress(null);
+    setSpectrumByRun((prev) => ({ ...prev, [runType]: null }));
   };
 
   const handleKeepMeasurement = (
@@ -291,7 +314,8 @@ export default function App() {
   const handleStartFreshProcedure = () => {
     stopLiveStream();
     setLockedAxis(null);
-    setPeakHoldByRun({});
+    setSpectrumByRun({});
+    setBufferProgress(null);
     setStreamError(null);
     setRuns(BLANK_RUNS(config));
     setCurrentScreen(1);
@@ -300,7 +324,8 @@ export default function App() {
   const handleResetBalancing = () => {
     stopLiveStream();
     setLockedAxis(null);
-    setPeakHoldByRun({});
+    setSpectrumByRun({});
+    setBufferProgress(null);
     setStreamError(null);
     setRuns(BLANK_RUNS(INITIAL_CONFIG));
     setConfig(INITIAL_CONFIG);
@@ -310,7 +335,8 @@ export default function App() {
   const handleReloadUserExample = () => {
     stopLiveStream();
     setLockedAxis(null);
-    setPeakHoldByRun({});
+    setSpectrumByRun({});
+    setBufferProgress(null);
     setStreamError(null);
     setRuns(INITIAL_RUNS);
     setConfig(INITIAL_CONFIG);
@@ -402,7 +428,9 @@ export default function App() {
           {' · '}O+T3: <strong className="text-slate-900">{runs[3].amplitudeMils}</strong>
           {' · '}Axis:{' '}
           <strong className="text-slate-900">
-            {(lockedAxis ?? config.sensorAxis).toUpperCase()}
+            {(lockedAxis ?? config.sensorAxis) === 'triaxial'
+              ? '3D'
+              : (lockedAxis ?? config.sensorAxis).toUpperCase()}
           </strong>
         </div>
 
@@ -446,12 +474,13 @@ export default function App() {
                 config={{ ...config, sensorAxis: lockedAxis ?? config.sensorAxis }}
                 isAxisLocked={lockedAxis !== null}
                 isStreaming={isStreaming}
-                peakHold={peakHoldByRun[currentRun.type] || null}
+                spectrum={spectrumByRun[currentRun.type] || null}
+                bufferProgress={bufferProgress}
                 streamError={streamError}
                 isSimulatorMode={isSimulatorMode}
                 onStartLiveStream={() => handleStartLiveStream(currentRun.type)}
                 onStopLiveStream={stopLiveStream}
-                onClearPeakHold={() => handleClearPeakHold(currentRun.type)}
+                onClearSpectrum={() => handleClearSpectrum(currentRun.type)}
                 onKeepMeasurement={(ampAU, freqHz) =>
                   handleKeepMeasurement(currentRun.type, ampAU, freqHz)
                 }
@@ -485,7 +514,7 @@ export default function App() {
 
       {/* Clean Footer */}
       <footer className="border-t border-slate-300 bg-white px-6 py-3.5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600 shrink-0">
-        <span>VibraBalance 4-Run · Peak-Hold Smartphone FFT Balancing (AU)</span>
+        <span>VibraBalance 4-Run · 1024-Sample Smartphone FFT Balancing (AU)</span>
         <button
           type="button"
           onClick={() => setIsInstallModalOpen(true)}

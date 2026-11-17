@@ -14,6 +14,7 @@ export interface LiveSpectrumFrame {
   sampleRateHz: number;
   nyquistHz: number;
   resolutionHz: number;
+  periodSec: number;
   fftSize: number;
   windowSamples: number;
   sensorSource: string;
@@ -21,17 +22,25 @@ export interface LiveSpectrumFrame {
   updatedAt: number;
 }
 
-export interface PeakHoldSpectrum {
-  frequenciesHz: number[]; // Fixed 0.5 Hz grid: 0, 0.5, 1.0, ..., 100.0 Hz
-  heldAmplitudesAU: number[]; // Max amplitude observed per bin
-  liveAmplitudesAU: number[]; // Most recent frame projected onto the same grid
-  sampleRateHz: number;
-  nyquistHz: number;
-  resolutionHz: number;
-  fftSize: number;
+export interface SpectrumMeasurement {
+  frequenciesHz: number[]; // Native FFT frequency bins (0 .. nyquistHz at resolutionHz steps)
+  amplitudesAU: number[]; // Steady low-variance averaged 1024-sample FFT magnitude (AU)
+  liveAmplitudesAU: number[]; // Most recent single 1024-sample FFT frame (AU)
+  sampleRateHz: number; // Acquisition rate (Hz)
+  nyquistHz: number; // Nyquist frequency (Hz)
+  resolutionHz: number; // Frequency resolution df = 1 / periodSec (Hz)
+  periodSec: number; // Exact time window of the N samples used (s)
+  samplesUsed: number; // Exact sample count used per FFT (1024)
   sensorSource: string;
   axisUsed: SensorAxis;
   frameCount: number;
+}
+
+export interface BufferProgress {
+  collected: number;
+  target: number;
+  estimatedRateHz: number | null;
+  sensorSource: string;
 }
 
 export type RunType = 'O' | 'O+T1' | 'O+T2' | 'O+T3';

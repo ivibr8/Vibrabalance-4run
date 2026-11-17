@@ -13,32 +13,39 @@ export const AxisOrientationGuide: React.FC<Props> = ({
   compact = false,
 }) => {
   const axesInfo: {
-    id: 'x' | 'y' | 'z';
-    label: string;
+    id: SensorAxis;
     short: string;
     tip: string;
+    badge: string;
     badgeColor: string;
   }[] = [
     {
       id: 'z',
-      label: 'Z-Axis (In / Out of Screen)',
       short: 'Z Axis',
-      tip: 'Phone lying flat on top of bearing housing (+Z points through the screen).',
+      badge: 'Z',
+      tip: 'Phone lying flat on bearing housing (+Z points through screen).',
       badgeColor: 'bg-amber-50 text-amber-800 border-amber-300',
     },
     {
       id: 'x',
-      label: 'X-Axis (Left ↔ Right)',
       short: 'X Axis',
+      badge: 'X',
       tip: 'Phone edge pressed sideways to measure horizontal bearing vibration.',
       badgeColor: 'bg-rose-50 text-rose-800 border-rose-300',
     },
     {
       id: 'y',
-      label: 'Y-Axis (Bottom ↔ Top)',
       short: 'Y Axis',
-      tip: 'Top edge of phone pointed toward or perpendicular to the shaft centerline.',
+      badge: 'Y',
+      tip: 'Top edge of phone pointed toward or perpendicular to shaft centerline.',
       badgeColor: 'bg-emerald-50 text-emerald-800 border-emerald-300',
+    },
+    {
+      id: 'triaxial',
+      short: '3D Total',
+      badge: 'XYZ',
+      tip: 'Phyphox-style 3D resultant √(X²+Y²+Z²) across all axes.',
+      badgeColor: 'bg-cyan-50 text-cyan-800 border-cyan-300',
     },
   ];
 
@@ -94,7 +101,7 @@ export const AxisOrientationGuide: React.FC<Props> = ({
               x2="98"
               y2="12"
               stroke="#059669"
-              strokeWidth={selectedAxis === 'y' ? '3.5' : '2'}
+              strokeWidth={selectedAxis === 'y' || selectedAxis === 'triaxial' ? '3.5' : '2'}
               markerEnd="url(#arrowY)"
             />
             <text
@@ -115,7 +122,7 @@ export const AxisOrientationGuide: React.FC<Props> = ({
               x2="182"
               y2="91"
               stroke="#e11d48"
-              strokeWidth={selectedAxis === 'x' ? '3.5' : '2'}
+              strokeWidth={selectedAxis === 'x' || selectedAxis === 'triaxial' ? '3.5' : '2'}
               markerEnd="url(#arrowX)"
             />
             <text
@@ -136,7 +143,7 @@ export const AxisOrientationGuide: React.FC<Props> = ({
               x2="42"
               y2="132"
               stroke="#d97706"
-              strokeWidth={selectedAxis === 'z' ? '3.5' : '2'}
+              strokeWidth={selectedAxis === 'z' || selectedAxis === 'triaxial' ? '3.5' : '2'}
               markerEnd="url(#arrowZ)"
             />
             <text
@@ -155,13 +162,13 @@ export const AxisOrientationGuide: React.FC<Props> = ({
           </span>
         </div>
 
-        {/* Selectable X / Y / Z Axis Buttons */}
+        {/* Selectable Z / X / Y / 3D Axis Buttons */}
         <div className="flex-1 space-y-2.5 w-full">
           <p className="text-xs text-slate-600 leading-relaxed">
-            Pick the phone axis aligned with the machine&apos;s radial vibration direction before starting the 4 runs, and keep the same phone mounting &amp; orientation for every run.
+            Pick one axis (Z, X, Y) aligned with radial vibration or <strong>3D Total</strong> before starting the 4 runs, and keep the exact same phone mounting for every run.
           </p>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             {axesInfo.map((ax) => {
               const active = selectedAxis === ax.id;
               const isInteractive = Boolean(onSelectAxis);
@@ -184,7 +191,7 @@ export const AxisOrientationGuide: React.FC<Props> = ({
                     <span
                       className={`text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded border ${ax.badgeColor}`}
                     >
-                      {ax.id.toUpperCase()}
+                      {ax.badge}
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-600 mt-1.5 leading-snug">{ax.tip}</p>

@@ -1,13 +1,13 @@
 import {
+  BufferProgress,
   LiveSpectrumFrame,
-  PeakHoldSpectrum,
   SensorAxis,
+  SpectrumMeasurement,
   VibrationSample,
 } from '../types/balancing';
 
-export const PEAK_HOLD_STEP_HZ = 0.5;
-export const PEAK_HOLD_MAX_HZ = 100;
-export const PEAK_HOLD_BIN_COUNT = PEAK_HOLD_MAX_HZ / PEAK_HOLD_STEP_HZ + 1; // 201 bins (0..100 Hz)
+export const PHYPHOX_FFT_SAMPLES = 1024;
+export const MIN_SPECTRUM_HZ = 1.0;
 
 /**
  * In-place Radix-2 Cooley-Tukey FFT. Length N must be a power of 2.
@@ -62,6 +62,7 @@ export function fftRadix2(real: Float64Array, imag: Float64Array): void {
 
 /**
  * Computes single-sided Hann-windowed FFT magnitudes (Arbitrary Units) for one signed axis.
+ * Subtracts block mean first to remove static gravity / DC offset cleanly.
  */
 function computeSingleAxisMagnitudes(values: Float64Array, fftSize: number): Float64Array {
   const n = fftSize;
@@ -98,34 +99,57 @@ function computeSingleAxisMagnitudes(values: Float64Array, fftSize: number): Flo
   return mags;
 }
 
-function pickLiveFftSize(availableCount: number): number {
-  if (availableCount >= 1024) return 1024;
-  if (availableCount >= 512) return 512;
-  if (availableCount >= 256) return 256;
-  if (availableCount >= 128) return 128;
-  return 0;
+/**
+ * Computes buffering progress while collecting the strict 1024-sample FFT block.
+ */
+export function computeBufferProgress(
+  samples: VibrationSample[],
+  sensorSource: string,
+  targetSamples = PHYPHOX_FFT_SAMPLES
+): BufferProgress {
+  let estimatedRateHz: number | null = null;
+  if (samples.length >= 12) {
+    const spanSec =
+      (samples[samples.length - 1].timestamp - samples[0].timestamp) / 1000;
+    if (spanSec > 0.05) {
+      estimatedRateHz = (samples.length - 1) / spanSec;
+    }
+  }
+
+  return {
+    collected: Math.min(samples.length, targetSamples),
+    target: targetSamples,
+    estimatedRateHz,
+    sensorSource,
+  };
 }
 
 /**
- * Computes a real-time sliding-window FFT frame from the latest real accelerometer samples.
+ * Phyphox-style strict 1024-sample real-time FFT frame.
+ * Never emits coarse 128/256/512 warmup frames, preserving sharp spectral peaks
+ * and exact bin spacing (df = 1 / period, Nyquist = fs / 2).
  */
 export function computeLiveSpectrumFrame(
   samples: VibrationSample[],
   axis: SensorAxis,
   sensorSource: string
 ): LiveSpectrumFrame | null {
-  const fftSize = pickLiveFftSize(samples.length);
-  if (fftSize === 0) return null;
+  const fftSize = PHYPHOX_FFT_SAMPLES;
+  if (samples.length < fftSize) return null;
 
   const slice = samples.slice(samples.length - fftSize);
   const spanSec = (slice[fftSize - 1].timestamp - slice[0].timestamp) / 1000;
-  if (spanSec <= 0.05) return null;
+  if (spanSec <= 0.1) return null;
 
-  const sampleRateHz = (fftSize - 1) / spanSec;
+  // Match Phyphox acc_spectrum.phyphox timing math:
+  // dt = Dt / (count - 1), period = actual_samples * dt, df = 1 / period, arate = 1 / dt, maxf = 0.5 / dt
+  const dtSec = spanSec / (fftSize - 1);
+  const sampleRateHz = 1 / dtSec;
   if (!Number.isFinite(sampleRateHz) || sampleRateHz < 10) return null;
 
-  const nyquistHz = sampleRateHz / 2;
-  const resolutionHz = sampleRateHz / fftSize;
+  const periodSec = fftSize * dtSec;
+  const resolutionHz = 1 / periodSec;
+  const nyquistHz = 0.5 / dtSec;
   const numBins = fftSize / 2 + 1;
 
   let amps: Float64Array;
@@ -157,8 +181,9 @@ export function computeLiveSpectrumFrame(
   const amplitudesAU = new Array<number>(numBins);
 
   for (let k = 0; k < numBins; k++) {
-    frequenciesHz[k] = k * resolutionHz;
-    amplitudesAU[k] = amps[k];
+    const freq = k * resolutionHz;
+    frequenciesHz[k] = freq;
+    amplitudesAU[k] = freq < MIN_SPECTRUM_HZ ? 0 : amps[k];
   }
 
   return {
@@ -167,6 +192,7 @@ export function computeLiveSpectrumFrame(
     sampleRateHz,
     nyquistHz,
     resolutionHz,
+    periodSec,
     fftSize,
     windowSamples: fftSize,
     sensorSource,
@@ -176,72 +202,47 @@ export function computeLiveSpectrumFrame(
 }
 
 /**
- * Projects an incoming live FFT frame onto a fixed 0.5 Hz grid (0..100 Hz)
- * and updates the Peak-Hold envelope: held[i] = max(held[i], live[i]).
- * Sub-1.5 Hz bins are suppressed so hand/tilt motion doesn't flood the hold.
+ * Maintains an unbiased, low-variance Phyphox-style spectrum measurement.
+ * Uses native FFT bins (no 0.5 Hz max-rebinning) and an unbiased exponential RMS
+ * filter across settled 1024-sample frames (never Peak-Hold max() latching),
+ * so transient bumps decay away and steady 1X peaks remain highly repeatable.
  */
-export function updatePeakHoldSpectrum(
-  prevHold: PeakHoldSpectrum | null,
+export function updateSpectrumMeasurement(
+  prev: SpectrumMeasurement | null,
   frame: LiveSpectrumFrame
-): PeakHoldSpectrum {
-  const frequenciesHz =
-    prevHold?.frequenciesHz ??
-    Array.from({ length: PEAK_HOLD_BIN_COUNT }, (_, i) => i * PEAK_HOLD_STEP_HZ);
+): SpectrumMeasurement {
+  const numBins = frame.frequenciesHz.length;
+  const canAverageWithPrev =
+    prev !== null &&
+    prev.amplitudesAU.length === numBins &&
+    prev.axisUsed === frame.axisUsed &&
+    Math.abs(prev.resolutionHz - frame.resolutionHz) < 0.08;
 
-  const liveGrid = new Array<number>(PEAK_HOLD_BIN_COUNT).fill(0);
+  const alpha = 0.28; // Smooths random frame-to-frame noise without locking upward spikes
+  const amplitudesAU = new Array<number>(numBins);
 
-  // Sample incoming spectrum onto fixed 0.5 Hz grid (suppressing < 1.5 Hz DC/tilt bump)
-  for (let gi = 0; gi < PEAK_HOLD_BIN_COUNT; gi++) {
-    const gf = frequenciesHz[gi];
-    if (gf < 1.5 || gf > frame.nyquistHz) {
-      liveGrid[gi] = 0;
-      continue;
+  for (let k = 0; k < numBins; k++) {
+    const liveVal = frame.amplitudesAU[k];
+    if (canAverageWithPrev && prev) {
+      const prevVal = prev.amplitudesAU[k] ?? liveVal;
+      amplitudesAU[k] = Math.sqrt((1 - alpha) * prevVal * prevVal + alpha * liveVal * liveVal);
+    } else {
+      amplitudesAU[k] = liveVal;
     }
-
-    // Use max of local FFT bins within ±0.35 Hz or linear interpolation so narrow peaks are never skipped
-    let maxNearby = 0;
-    let foundNearby = false;
-    for (let k = 1; k < frame.frequenciesHz.length; k++) {
-      const f = frame.frequenciesHz[k];
-      if (Math.abs(f - gf) <= PEAK_HOLD_STEP_HZ * 0.65) {
-        if (frame.amplitudesAU[k] > maxNearby) {
-          maxNearby = frame.amplitudesAU[k];
-        }
-        foundNearby = true;
-      }
-    }
-
-    if (!foundNearby) {
-      // Linear interpolation fallback when df > step
-      const exactK = gf / frame.resolutionHz;
-      const k0 = Math.floor(exactK);
-      const k1 = Math.min(frame.amplitudesAU.length - 1, k0 + 1);
-      const frac = exactK - k0;
-      if (k0 >= 1 && k0 < frame.amplitudesAU.length) {
-        maxNearby =
-          frame.amplitudesAU[k0] * (1 - frac) + frame.amplitudesAU[k1] * frac;
-      }
-    }
-
-    liveGrid[gi] = maxNearby;
-  }
-
-  const heldAmplitudesAU = new Array<number>(PEAK_HOLD_BIN_COUNT);
-  for (let gi = 0; gi < PEAK_HOLD_BIN_COUNT; gi++) {
-    const prevVal = prevHold ? prevHold.heldAmplitudesAU[gi] ?? 0 : 0;
-    heldAmplitudesAU[gi] = Math.max(prevVal, liveGrid[gi]);
   }
 
   return {
-    frequenciesHz,
-    heldAmplitudesAU,
-    liveAmplitudesAU: liveGrid,
+    frequenciesHz: frame.frequenciesHz,
+    amplitudesAU,
+    liveAmplitudesAU: frame.amplitudesAU,
     sampleRateHz: frame.sampleRateHz,
     nyquistHz: frame.nyquistHz,
     resolutionHz: frame.resolutionHz,
-    fftSize: frame.fftSize,
+    periodSec: frame.periodSec,
+    samplesUsed: frame.fftSize,
     sensorSource: frame.sensorSource,
     axisUsed: frame.axisUsed,
-    frameCount: (prevHold?.frameCount ?? 0) + 1,
+    frameCount: canAverageWithPrev && prev ? prev.frameCount + 1 : 1,
   };
 }
+

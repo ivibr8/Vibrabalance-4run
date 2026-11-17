@@ -8,7 +8,7 @@ export interface LiveSensorCallbacks {
   ) => void;
 }
 
-const MAX_BUFFER_SAMPLES = 1280; // Keeps last 1024+ samples for rolling real-time FFT
+const MAX_BUFFER_SAMPLES = 2048; // Holds strict 1024-sample FFT windows cleanly
 
 export class SensorManager {
   private isStreaming = false;
@@ -75,12 +75,12 @@ export class SensorManager {
   }
 
   /**
-   * Starts real-time accelerometer streaming into a rolling ring buffer and emits
-   * periodic buffer snapshots (~10 Hz UI update cadence) for live FFT rendering.
+   * Starts real-time accelerometer streaming into a rolling buffer and emits
+   * snapshots every 100 ms (~10 Hz, matching Phyphox analysis cadence).
    *
    * On Android Chrome where Generic Sensor Accelerometer API exists, briefly probes
-   * both DeviceMotionEvent and Accelerometer({ frequency: 400 }) for 500ms and
-   * automatically keeps whichever delivers the higher real sample rate.
+   * both DeviceMotionEvent and Accelerometer (requesting highest allowed hardware rate)
+   * for 550ms and automatically keeps whichever delivers the higher real sample rate.
    */
   public startLiveStream(simulationConfig?: {
     runType: 'O' | 'O+T1' | 'O+T2' | 'O+T3';
@@ -92,7 +92,7 @@ export class SensorManager {
     this.isStreaming = true;
 
     if (simulationConfig) {
-      this.activeSource = 'Simulator (400 Hz)';
+      this.activeSource = 'Simulator (411 Hz)';
       this.callbacks.onStatusChange?.('streaming');
       this.startSimulator(simulationConfig.runType, simulationConfig.baseRpm);
       return;
@@ -109,10 +109,11 @@ export class SensorManager {
 
     this.callbacks.onStatusChange?.('streaming');
 
-    // Separate probe buffers for the first 500ms so whichever API fires faster wins
+    // Separate probe buffers for the first 550ms so whichever API fires faster wins
     const dmBuffer: VibrationSample[] = [];
     const accelBuffer: VibrationSample[] = [];
     let settled = false;
+    let lastAccelTs = 0;
 
     const pushSample = (x: number, y: number, z: number, now: number) => {
       this.samples.push({
@@ -149,7 +150,6 @@ export class SensorManager {
 
       if (!settled) {
         dmBuffer.push(sample);
-        // Feed main buffer from DeviceMotion right away until probe settles
         pushSample(sample.x, sample.y, sample.z, sample.timestamp);
       } else {
         pushSample(sample.x, sample.y, sample.z, sample.timestamp);
@@ -161,31 +161,46 @@ export class SensorManager {
     window.addEventListener('devicemotion', motionListener, { passive: true });
 
     const hasGeneric = typeof window !== 'undefined' && 'Accelerometer' in window;
-    let accelSensor: {
+    type GenericAccel = {
       x: number | null;
       y: number | null;
       z: number | null;
+      timestamp?: number | null;
       start: () => void;
       stop: () => void;
       addEventListener: (type: string, cb: () => void) => void;
-    } | null = null;
+    };
+    let accelSensor: GenericAccel | null = null;
 
     if (hasGeneric) {
       try {
-        type AccelCtor = new (opts?: { frequency?: number }) => {
-          x: number | null;
-          y: number | null;
-          z: number | null;
-          start: () => void;
-          stop: () => void;
-          addEventListener: (type: string, cb: () => void) => void;
-        };
+        type AccelCtor = new (opts?: { frequency?: number }) => GenericAccel;
         const Ctor = (window as unknown as { Accelerometer: AccelCtor }).Accelerometer;
-        accelSensor = new Ctor({ frequency: 400 });
+
+        // Try 500 Hz first so sensors running at ~411 Hz are not capped below hardware max
+        try {
+          accelSensor = new Ctor({ frequency: 500 });
+        } catch {
+          try {
+            accelSensor = new Ctor({ frequency: 400 });
+          } catch {
+            accelSensor = new Ctor();
+          }
+        }
 
         accelSensor.addEventListener('reading', () => {
           if (!this.isStreaming || !accelSensor) return;
-          const now = performance.now();
+          const perfNow = performance.now();
+          const hwTs = accelSensor.timestamp;
+          // Prefer native hardware DOMHighResTimeStamp if valid, monotonic, and aligned with performance.now()
+          const useHwTs =
+            typeof hwTs === 'number' &&
+            Number.isFinite(hwTs) &&
+            hwTs > lastAccelTs &&
+            Math.abs(hwTs - perfNow) < 10000;
+          const now = useHwTs ? hwTs : perfNow > lastAccelTs ? perfNow : lastAccelTs + 0.01;
+          lastAccelTs = now;
+
           const x = accelSensor.x ?? 0;
           const y = accelSensor.y ?? 0;
           const z = accelSensor.z ?? 0;
@@ -230,7 +245,6 @@ export class SensorManager {
         settled = true;
 
         if (accelBuffer.length > dmBuffer.length * 1.1 && accelBuffer.length >= 10) {
-          // Generic Sensor Accelerometer API is faster on this browser -> switch cleanly
           if (this.motionHandler) {
             window.removeEventListener('devicemotion', this.motionHandler);
             this.motionHandler = null;
@@ -238,7 +252,6 @@ export class SensorManager {
           this.activeSource = 'Accelerometer API';
           this.samples = accelBuffer.slice(-MAX_BUFFER_SAMPLES);
         } else {
-          // Keep DeviceMotionEvent and close Generic Sensor listener
           if (this.genericSensor) {
             try {
               this.genericSensor.stop();
@@ -252,11 +265,11 @@ export class SensorManager {
       }, 550);
     }
 
-    // Emit live buffer updates smoothly every 110ms (~9 FPS for responsive FFT updates)
+    // Emit live buffer updates every 100ms (10 Hz cadence matching Phyphox sleep="0.1")
     this.emitTimer = window.setInterval(() => {
       if (!this.isStreaming) return;
       this.callbacks.onSamplesBuffer?.([...this.samples], this.activeSource);
-    }, 110);
+    }, 100);
   }
 
   private cleanupHardware(): void {
@@ -298,14 +311,15 @@ export class SensorManager {
 
   /**
    * Desktop / offline test signal generator (active ONLY when user enables Simulator Mode).
-   * Streams at 400 Hz (200 Hz full spectrum) with a 1X rotor unbalance peak at nominalRpm/60 Hz.
+   * Streams at 411 Hz (Nyquist 206 Hz, 1024 samples = 2.49 s, resolution 0.40 Hz)
+   * matching Phyphox hardware parameters.
    */
   private startSimulator(
     runType: 'O' | 'O+T1' | 'O+T2' | 'O+T3',
     baseRpm: number
   ): void {
     const f1X = baseRpm > 0 ? baseRpm / 60 : 43;
-    const fs = 400;
+    const fs = 411;
     const dtMs = 1000 / fs;
     const targetAmpMap = {
       'O': 3.75,
@@ -325,12 +339,11 @@ export class SensorManager {
       while (sampleIdx < targetIdx) {
         const tSec = (sampleIdx * dtMs) / 1000;
         const angle = 2 * Math.PI * f1X * tSec;
-        // Realistic slight amplitude drift (~±4%) so watching 10s average is meaningful
-        const modulation = 1 + 0.04 * Math.sin(tSec * 1.3);
+        const modulation = 1 + 0.03 * Math.sin(tSec * 1.1);
         const sig =
           amp * modulation * Math.sin(angle) +
           amp * 0.14 * Math.sin(2 * angle + 0.4) +
-          (Math.random() - 0.5) * amp * 0.06;
+          (Math.random() - 0.5) * amp * 0.05;
 
         const x = sig * 0.45;
         const y = sig * 0.25;

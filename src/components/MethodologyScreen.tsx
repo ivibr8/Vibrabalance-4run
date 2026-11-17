@@ -125,7 +125,7 @@ export const MethodologyScreen: React.FC<Props> = ({
       {/* Clean Overview Header */}
       <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-5 sm:p-6 space-y-2">
         <p className="text-xs font-mono text-slate-500">
-          Single-Plane No-Phase Balancing · Live FFT Spectrum (AU)
+          Single-Plane No-Phase Balancing · 1024-Sample FFT Spectrum (AU)
         </p>
         <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
           Four-Run Dynamic Rotor Balancing
@@ -300,12 +300,12 @@ export const MethodologyScreen: React.FC<Props> = ({
       <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-5 sm:p-6 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-sm font-bold text-slate-900">
-            02. Select Sensing Axis (X, Y, or Z)
+            02. Select Sensing Axis (X, Y, Z, or 3D)
           </h2>
           {isAxisLocked && (
             <span className="flex items-center gap-1 text-xs font-semibold text-amber-700">
               <Lock className="w-3.5 h-3.5" />
-              <span>Locked to {lockedAxis?.toUpperCase()} for active session</span>
+              <span>Locked to {lockedAxis === 'triaxial' ? '3D' : lockedAxis?.toUpperCase()} for active session</span>
             </span>
           )}
         </div>
@@ -325,7 +325,7 @@ export const MethodologyScreen: React.FC<Props> = ({
               onChange={(e) => onToggleSimulator(e.target.checked)}
               className="rounded border-slate-300 text-cyan-600 focus:ring-cyan-500 cursor-pointer"
             />
-            <span>Simulator Mode (synthetic 400 Hz signal for desktop testing)</span>
+            <span>Simulator Mode (synthetic 411 Hz / 1024-sample signal for desktop testing)</span>
           </label>
         </div>
       </div>
