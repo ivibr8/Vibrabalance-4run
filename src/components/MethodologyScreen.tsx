@@ -131,7 +131,7 @@ export const MethodologyScreen: React.FC<Props> = ({
           Four-Run Dynamic Rotor Balancing
         </h1>
         <p className="text-sm text-slate-600 leading-relaxed">
-          Take four relative vibration readings (<strong>O</strong>, <strong>O+T1</strong>, <strong>O+T2</strong>, <strong>O+T3</strong>) by watching the live spectrum and picking your 1X unbalance peak, or enter values manually. Only relative magnitude changes matter, so Arbitrary Units (AU) compute the exact correction weight and angle.
+          Measure and record the original 1X unbalance amplitude (<strong>O</strong>) at a fixed radial measurement location. Next, place a trial weight at a constant radius from the shaft centerline and collect three additional amplitude readings (<strong>O+T1</strong>, <strong>O+T2</strong>, <strong>O+T3</strong>) with the trial weight installed at three angular positions separated by approximately 120&deg;. The resulting four measurements are plotted to determine the optimum correction weight and correction angle. Because the method relies on relative amplitude changes rather than calibrated vibration values, measurements may be entered in Arbitrary Units (AU). All readings should be taken at the same radial measurement location. <strong>CAUTION:</strong> This procedure only works if unbalance is the cause of the high vibration.
         </p>
       </div>
 

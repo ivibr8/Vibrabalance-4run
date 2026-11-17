@@ -766,7 +766,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
               <Crosshair className="w-4 h-4 text-amber-600" />
               <span>
                 {selectedFreqHz === null
-                  ? 'Tap any peak on the Peak-Hold spectrum after removing the phone to select your 1X value'
+                  ? 'Tap the peak at the running speed frequency on the Peak-Hold spectrum after removing the phone to select your 1X value'
                   : `Selected 1X Peak @ ${selectedFreqHz.toFixed(1)} Hz (${Math.round(selectedFreqHz * 60)} RPM)`}
               </span>
             </div>
@@ -834,7 +834,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
             Accepted Run Value / Manual Override (AU)
           </span>
           <span className="text-[11px] text-slate-500 block">
-            Use the Peak-Hold value above or type a reading directly (e.g. from Phyphox or a meter).
+            Use the Peak-Hold value above or type a reading directly (e.g. from Phyphox or a meter). Measurements can be repeated to establish consistency
           </span>
         </div>
 
