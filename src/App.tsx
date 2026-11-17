@@ -253,6 +253,20 @@ export default function App() {
     setSpectrumByRun((prev) => ({ ...prev, [runType]: null }));
   };
 
+  const handleImportSpectrum = (
+    runType: RunType,
+    imported: SpectrumMeasurement
+  ) => {
+    stopLiveStream();
+    setStreamError(null);
+    setBufferProgress(null);
+    setLastSampleRate(Math.round(imported.sampleRateHz));
+    setSpectrumByRun((prev) => ({
+      ...prev,
+      [runType]: imported,
+    }));
+  };
+
   const handleKeepMeasurement = (
     runType: RunType,
     ampAU: number,
@@ -481,6 +495,9 @@ export default function App() {
                 onStartLiveStream={() => handleStartLiveStream(currentRun.type)}
                 onStopLiveStream={stopLiveStream}
                 onClearSpectrum={() => handleClearSpectrum(currentRun.type)}
+                onImportSpectrum={(imported) =>
+                  handleImportSpectrum(currentRun.type, imported)
+                }
                 onKeepMeasurement={(ampAU, freqHz) =>
                   handleKeepMeasurement(currentRun.type, ampAU, freqHz)
                 }
