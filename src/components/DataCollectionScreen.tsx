@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   BalancingConfig,
   BufferProgress,
@@ -6,6 +6,7 @@ import {
   SensorAxis,
   SpectrumMeasurement,
 } from '../types/balancing';
+import { parsePhyphoxCsv } from '../utils/fft';
 import {
   Activity,
   AlertTriangle,
@@ -19,6 +20,7 @@ import {
   Play,
   RotateCcw,
   Square,
+  Upload,
 } from 'lucide-react';
 
 interface NumericInputProps {
@@ -131,6 +133,7 @@ interface Props {
   onStartLiveStream: () => void;
   onStopLiveStream: () => void;
   onClearSpectrum: () => void;
+  onImportSpectrum: (spectrum: SpectrumMeasurement) => void;
   onKeepMeasurement: (ampAU: number, frequencyHz: number) => void;
   onUpdateManualAmp: (ampAU: number) => void;
   onUpdatePhaseAngle: (deg: number) => void;
@@ -152,6 +155,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
   onStartLiveStream,
   onStopLiveStream,
   onClearSpectrum,
+  onImportSpectrum,
   onKeepMeasurement,
   onUpdateManualAmp,
   onUpdatePhaseAngle,
@@ -159,11 +163,13 @@ export const DataCollectionScreen: React.FC<Props> = ({
   onNextScreen,
   onPrevScreen,
 }) => {
-  // Auto-adapts to browser Nyquist (e.g. 0-30 Hz at 60 Hz Chrome) or 0-200 Hz at 411 Hz, unless user picks manually
+  // Auto-adapts to browser Nyquist (e.g. 0-30 Hz at 60 Hz Chrome) or 0-200 Hz at 411/412 Hz, unless user picks manually
   const [rangeHz, setRangeHz] = useState<30 | 60 | 100 | 200>(200);
   const [hasManualRange, setHasManualRange] = useState<boolean>(false);
   // Selected bin index on FFT grid (never auto-selected)
   const [selectedBinIdx, setSelectedBinIdx] = useState<number | null>(null);
+  const [csvError, setCsvError] = useState<string | null>(null);
+  const csvInputRef = useRef<HTMLInputElement>(null);
   const [optionalRpm, setOptionalRpm] = useState<string>(
     config.nominalRpm > 0 ? String(config.nominalRpm) : ''
   );
@@ -237,8 +243,11 @@ export const DataCollectionScreen: React.FC<Props> = ({
 
     const tappedFreq = ((svgX - padLeft) / plotWidth) * displayMaxHz;
 
-    // Snap gently to highest local peak within ±1.2 Hz (zoomed) or ±2.0 Hz of tap for easy mobile selection
-    const snapRadiusHz = displayMaxHz <= 35 ? 1.2 : 2.0;
+    // Snap gently to highest local peak near tap for easy mobile selection (scales with bin resolution)
+    const snapRadiusHz = Math.max(
+      displayMaxHz <= 35 ? 1.2 : 2.5,
+      (spectrum.resolutionHz || 1) * 1.15
+    );
     let bestIdx = -1;
     let bestAmp = -1;
     for (const idx of visibleIndices) {
@@ -317,6 +326,48 @@ export const DataCollectionScreen: React.FC<Props> = ({
   const bufferPct = bufferProgress
     ? Math.min(100, Math.round((bufferProgress.collected / bufferProgress.target) * 100))
     : 0;
+
+  const handleCsvFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = parsePhyphoxCsv(text);
+      if (!parsed) {
+        setCsvError(
+          'Could not parse CSV. Export Phyphox Acceleration Spectrum as CSV ("Frequency (Hz)","Absolute Amplitude (a.u.)").'
+        );
+        return;
+      }
+      setCsvError(null);
+      setSelectedBinIdx(null);
+      setHasManualRange(false);
+      onImportSpectrum(parsed);
+    } catch {
+      setCsvError('Failed to read the selected CSV file.');
+    }
+  };
+
+  const handleLoadAttachedSampleCsv = async () => {
+    try {
+      const res = await fetch('/assets/aistudio/FFT_Spectrum_9bcf5eb1.csv');
+      if (!res.ok) {
+        setCsvError('Use Import Phyphox CSV to load a CSV file from your device.');
+        return;
+      }
+      const text = await res.text();
+      const parsed = parsePhyphoxCsv(text);
+      if (parsed) {
+        setCsvError(null);
+        setSelectedBinIdx(null);
+        setHasManualRange(false);
+        onImportSpectrum(parsed);
+      }
+    } catch {
+      setCsvError('Use Import Phyphox CSV to load a CSV file from your device.');
+    }
+  };
 
   return (
     <div className="max-w-4xl mx-auto space-y-4 py-1">
@@ -417,6 +468,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
               type="button"
               onClick={() => {
                 setSelectedBinIdx(null);
+                setCsvError(null);
                 onClearSpectrum();
               }}
               disabled={!spectrum && !bufferProgress}
@@ -425,6 +477,23 @@ export const DataCollectionScreen: React.FC<Props> = ({
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>Clear</span>
+            </button>
+
+            <input
+              ref={csvInputRef}
+              type="file"
+              accept=".csv,text/csv"
+              onChange={handleCsvFileChange}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => csvInputRef.current?.click()}
+              className="min-h-[44px] px-3.5 py-2 rounded-xl border border-cyan-600/40 bg-cyan-50 hover:bg-cyan-100 text-cyan-900 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors"
+              title="Import full 0–200 Hz (412 Hz) Acceleration Spectrum CSV exported from Phyphox"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>Import Phyphox CSV</span>
             </button>
 
             {/* Range Toggle: 30 Hz, 60 Hz, 100 Hz, 200 Hz */}
@@ -519,10 +588,10 @@ export const DataCollectionScreen: React.FC<Props> = ({
           </span>
         </div>
 
-        {streamError && (
+        {(streamError || csvError) && (
           <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 flex items-start gap-2.5 text-xs text-rose-900">
             <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-            <span>{streamError}</span>
+            <span>{streamError || csvError}</span>
           </div>
         )}
 
@@ -559,9 +628,18 @@ export const DataCollectionScreen: React.FC<Props> = ({
               )}
 
               {!isStreaming && (
-                <p className="text-xs text-slate-500 max-w-md">
-                  Hold your phone steady against the bearing housing, tap <strong>Start Spectrum</strong> (~2 s to first display, refines up to ~4 s), then tap <strong>Stop &amp; Freeze</strong> and remove the phone to select the 1X peak.
-                </p>
+                <div className="space-y-2.5 max-w-md">
+                  <p className="text-xs text-slate-500">
+                    Hold your phone steady against the bearing housing and tap <strong>Start Spectrum</strong> (~2 s, browser 30 Hz limit), OR tap <strong>Import Phyphox CSV</strong> to view a full 0–200 Hz (412 Hz rate) Phyphox scan directly.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleLoadAttachedSampleCsv}
+                    className="text-[11px] font-semibold text-cyan-700 hover:text-cyan-800 hover:underline cursor-pointer"
+                  >
+                    Preview Attached Phyphox 41.9 Hz (412 Hz) CSV
+                  </button>
+                </div>
               )}
             </div>
           ) : (
@@ -631,7 +709,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
                       fontSize="10.5"
                       fontFamily="monospace"
                     >
-                      {v >= 1 ? v.toFixed(1) : v.toFixed(2)}
+                      {v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v.toFixed(2)}
                     </text>
                   </g>
                 );
@@ -743,7 +821,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
                 );
               })()}
 
-              {/* Primary Sharp 1024-Sample Native-Bin FFT Curve */}
+              {/* Primary Sharp FFT Curve */}
               {(() => {
                 const pts = visibleIndices.map(
                   (idx) =>
@@ -769,6 +847,16 @@ export const DataCollectionScreen: React.FC<Props> = ({
                       strokeWidth="2.1"
                       strokeLinejoin="round"
                     />
+                    {visibleIndices.length <= 80 &&
+                      visibleIndices.map((idx) => (
+                        <circle
+                          key={`pt-${idx}`}
+                          cx={getX(spectrum.frequenciesHz[idx])}
+                          cy={getY(spectrum.amplitudesAU[idx] ?? 0)}
+                          r="2.3"
+                          fill="#0284c7"
+                        />
+                      ))}
                   </>
                 );
               })()}
@@ -831,8 +919,8 @@ export const DataCollectionScreen: React.FC<Props> = ({
             <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
             <div>
               <strong>Browser Sensor Limit ({Math.round(spectrum.sampleRateHz)} Hz · Nyquist {Math.round(spectrum.nyquistHz)} Hz):</strong>{' '}
-              Chrome &amp; Safari sandbox all web pages to ~60 Hz (~30 Hz max unaliased frequency), whereas native apps like Phyphox hold Android&apos;s <code className="font-mono text-[11px] bg-amber-100/80 px-1 rounded">HIGH_SAMPLING_RATE_SENSORS</code> permission for ~411 Hz (206 Hz Nyquist).
-              Higher harmonics (e.g. 2X/3X) fold down into lower bins here — or you can enter Phyphox&apos;s 1X peak value directly in <strong>Manual Override (AU)</strong> below.
+              Chrome &amp; Safari hard-cap all web pages at ~60 Hz (~30 Hz max unaliased frequency), so a 41.9 Hz rotor + harmonics cannot be measured live inside a web browser. Native apps like Phyphox hold Android&apos;s <code className="font-mono text-[11px] bg-amber-100/80 px-1 rounded">HIGH_SAMPLING_RATE_SENSORS</code> permission for ~412 Hz (206 Hz Nyquist).
+              To see and tap the exact 0–200 Hz spectrum here, export CSV from Phyphox and click <strong>Import Phyphox CSV</strong> above (or enter the 1X value in <strong>Manual Override</strong>).
             </div>
           </div>
         )}
