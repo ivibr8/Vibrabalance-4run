@@ -7,6 +7,7 @@ import {
 } from '../types/balancing';
 
 export const PHYPHOX_FFT_SAMPLES = 1024;
+export const BROWSER_MIN_WINDOW_SAMPLES = 128; // ~2.1s at 60 Hz for fast startup
 export const MIN_SPECTRUM_HZ = 1.0;
 
 /**
@@ -61,34 +62,59 @@ export function fftRadix2(real: Float64Array, imag: Float64Array): void {
 }
 
 /**
- * Computes single-sided Hann-windowed FFT magnitudes (Arbitrary Units) for one signed axis.
- * Subtracts block mean first to remove static gravity / DC offset cleanly.
+ * Picks the largest power-of-2 real sample count (128..1024) suited for the
+ * sensor's actual sample rate so the user never waits 17+ seconds on a 60 Hz browser,
+ * while native-rate sensors (~400+ Hz) still use full 1024 real samples (~2.5 s).
  */
-function computeSingleAxisMagnitudes(values: Float64Array, fftSize: number): Float64Array {
-  const n = fftSize;
+function pickRealWindowSize(availableCount: number, estRateHz: number | null): number {
+  const maxForRate =
+    estRateHz === null || estRateHz >= 280
+      ? 1024
+      : estRateHz >= 140
+      ? 512
+      : 256;
+
+  if (availableCount >= 1024 && maxForRate >= 1024) return 1024;
+  if (availableCount >= 512 && maxForRate >= 512) return 512;
+  if (availableCount >= 256 && maxForRate >= 256) return 256;
+  if (availableCount >= 128) return 128;
+  return 0;
+}
+
+/**
+ * Computes single-sided Hann-windowed FFT magnitudes (Arbitrary Units) for `nReal`
+ * samples zero-padded to `fftSize` (1024). Subtracts mean first to remove static gravity.
+ * Normalizes strictly by `windowSum` of the Hann window so amplitudes stay calibrated
+ * across 128, 256, 512, and 1024 real-sample windows with minimal scalloping loss.
+ */
+function computeSingleAxisMagnitudes(
+  values: Float64Array,
+  nReal: number,
+  fftSize: number
+): Float64Array {
   let mean = 0;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < nReal; i++) {
     mean += values[i];
   }
-  mean /= n;
+  mean /= nReal;
 
-  const real = new Float64Array(n);
-  const imag = new Float64Array(n);
+  const real = new Float64Array(fftSize);
+  const imag = new Float64Array(fftSize);
 
   let windowSum = 0;
-  for (let i = 0; i < n; i++) {
-    const w = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
+  for (let i = 0; i < nReal; i++) {
+    const w = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (nReal - 1)));
     windowSum += w;
     real[i] = (values[i] - mean) * w;
   }
 
   fftRadix2(real, imag);
 
-  const halfN = n / 2;
+  const halfN = fftSize / 2;
   const numBins = halfN + 1;
   const mags = new Float64Array(numBins);
-  const scaleSingle = windowSum > 0 ? 2.0 / windowSum : 2.0 / n;
-  const scaleNyq = windowSum > 0 ? 1.0 / windowSum : 1.0 / n;
+  const scaleSingle = windowSum > 0 ? 2.0 / windowSum : 2.0 / nReal;
+  const scaleNyq = windowSum > 0 ? 1.0 / windowSum : 1.0 / nReal;
 
   for (let k = 1; k < numBins; k++) {
     const s = k === halfN ? scaleNyq : scaleSingle;
@@ -99,89 +125,96 @@ function computeSingleAxisMagnitudes(values: Float64Array, fftSize: number): Flo
   return mags;
 }
 
+function estimateSampleRateHz(samples: VibrationSample[]): number | null {
+  if (samples.length < 12) return null;
+  const spanSec = (samples[samples.length - 1].timestamp - samples[0].timestamp) / 1000;
+  if (spanSec <= 0.05) return null;
+  const rate = (samples.length - 1) / spanSec;
+  return Number.isFinite(rate) && rate >= 10 ? rate : null;
+}
+
 /**
- * Computes buffering progress while collecting the strict 1024-sample FFT block.
+ * Computes buffering progress toward the initial fast spectrum window
+ * (128 samples ≈ 2.1 s on 60 Hz browsers, 1024 samples ≈ 2.5 s at 411 Hz).
  */
 export function computeBufferProgress(
   samples: VibrationSample[],
-  sensorSource: string,
-  targetSamples = PHYPHOX_FFT_SAMPLES
+  sensorSource: string
 ): BufferProgress {
-  let estimatedRateHz: number | null = null;
-  if (samples.length >= 12) {
-    const spanSec =
-      (samples[samples.length - 1].timestamp - samples[0].timestamp) / 1000;
-    if (spanSec > 0.05) {
-      estimatedRateHz = (samples.length - 1) / spanSec;
-    }
-  }
+  const estimatedRateHz = estimateSampleRateHz(samples);
+  const target =
+    estimatedRateHz !== null && estimatedRateHz < 280
+      ? BROWSER_MIN_WINDOW_SAMPLES
+      : PHYPHOX_FFT_SAMPLES;
 
   return {
-    collected: Math.min(samples.length, targetSamples),
-    target: targetSamples,
+    collected: Math.min(samples.length, target),
+    target,
     estimatedRateHz,
     sensorSource,
   };
 }
 
 /**
- * Phyphox-style strict 1024-sample real-time FFT frame.
- * Never emits coarse 128/256/512 warmup frames, preserving sharp spectral peaks
- * and exact bin spacing (df = 1 / period, Nyquist = fs / 2).
+ * Adaptive Phyphox-style FFT frame:
+ * - At 400+ Hz: uses full 1024 real samples (2.49 s period, 0.40 Hz resolution, 206 Hz Nyquist).
+ * - At ~60 Hz browser limit: starts at 128 real samples (2.1 s) and steps cleanly to 256 (4.3 s),
+ *   zero-padded to 1024 FFT points for razor-sharp peak localization without 17s stalls.
  */
 export function computeLiveSpectrumFrame(
   samples: VibrationSample[],
   axis: SensorAxis,
   sensorSource: string
 ): LiveSpectrumFrame | null {
-  const fftSize = PHYPHOX_FFT_SAMPLES;
-  if (samples.length < fftSize) return null;
+  const estRate = estimateSampleRateHz(samples);
+  const nReal = pickRealWindowSize(samples.length, estRate);
+  if (nReal === 0) return null;
 
-  const slice = samples.slice(samples.length - fftSize);
-  const spanSec = (slice[fftSize - 1].timestamp - slice[0].timestamp) / 1000;
+  const fftSize = PHYPHOX_FFT_SAMPLES;
+  const slice = samples.slice(samples.length - nReal);
+  const spanSec = (slice[nReal - 1].timestamp - slice[0].timestamp) / 1000;
   if (spanSec <= 0.1) return null;
 
-  // Match Phyphox acc_spectrum.phyphox timing math:
-  // dt = Dt / (count - 1), period = actual_samples * dt, df = 1 / period, arate = 1 / dt, maxf = 0.5 / dt
-  const dtSec = spanSec / (fftSize - 1);
+  const dtSec = spanSec / (nReal - 1);
   const sampleRateHz = 1 / dtSec;
   if (!Number.isFinite(sampleRateHz) || sampleRateHz < 10) return null;
 
-  const periodSec = fftSize * dtSec;
+  const periodSec = nReal * dtSec;
   const resolutionHz = 1 / periodSec;
   const nyquistHz = 0.5 / dtSec;
+  const displayStepHz = sampleRateHz / fftSize;
   const numBins = fftSize / 2 + 1;
 
   let amps: Float64Array;
   if (axis === 'triaxial') {
-    const vx = new Float64Array(fftSize);
-    const vy = new Float64Array(fftSize);
-    const vz = new Float64Array(fftSize);
-    for (let i = 0; i < fftSize; i++) {
+    const vx = new Float64Array(nReal);
+    const vy = new Float64Array(nReal);
+    const vz = new Float64Array(nReal);
+    for (let i = 0; i < nReal; i++) {
       vx[i] = slice[i].x;
       vy[i] = slice[i].y;
       vz[i] = slice[i].z;
     }
-    const mx = computeSingleAxisMagnitudes(vx, fftSize);
-    const my = computeSingleAxisMagnitudes(vy, fftSize);
-    const mz = computeSingleAxisMagnitudes(vz, fftSize);
+    const mx = computeSingleAxisMagnitudes(vx, nReal, fftSize);
+    const my = computeSingleAxisMagnitudes(vy, nReal, fftSize);
+    const mz = computeSingleAxisMagnitudes(vz, nReal, fftSize);
     amps = new Float64Array(numBins);
     for (let k = 0; k < numBins; k++) {
       amps[k] = Math.hypot(mx[k], my[k], mz[k]);
     }
   } else {
-    const v = new Float64Array(fftSize);
-    for (let i = 0; i < fftSize; i++) {
+    const v = new Float64Array(nReal);
+    for (let i = 0; i < nReal; i++) {
       v[i] = slice[i][axis];
     }
-    amps = computeSingleAxisMagnitudes(v, fftSize);
+    amps = computeSingleAxisMagnitudes(v, nReal, fftSize);
   }
 
   const frequenciesHz = new Array<number>(numBins);
   const amplitudesAU = new Array<number>(numBins);
 
   for (let k = 0; k < numBins; k++) {
-    const freq = k * resolutionHz;
+    const freq = k * displayStepHz;
     frequenciesHz[k] = freq;
     amplitudesAU[k] = freq < MIN_SPECTRUM_HZ ? 0 : amps[k];
   }
@@ -194,7 +227,7 @@ export function computeLiveSpectrumFrame(
     resolutionHz,
     periodSec,
     fftSize,
-    windowSamples: fftSize,
+    windowSamples: nReal,
     sensorSource,
     axisUsed: axis,
     updatedAt: performance.now(),
@@ -202,10 +235,8 @@ export function computeLiveSpectrumFrame(
 }
 
 /**
- * Maintains an unbiased, low-variance Phyphox-style spectrum measurement.
- * Uses native FFT bins (no 0.5 Hz max-rebinning) and an unbiased exponential RMS
- * filter across settled 1024-sample frames (never Peak-Hold max() latching),
- * so transient bumps decay away and steady 1X peaks remain highly repeatable.
+ * Maintains an unbiased, low-variance spectrum measurement using an exponential RMS filter
+ * across settled frames of matching window size (never Peak-Hold max() latching).
  */
 export function updateSpectrumMeasurement(
   prev: SpectrumMeasurement | null,
@@ -215,10 +246,11 @@ export function updateSpectrumMeasurement(
   const canAverageWithPrev =
     prev !== null &&
     prev.amplitudesAU.length === numBins &&
+    prev.samplesUsed === frame.windowSamples &&
     prev.axisUsed === frame.axisUsed &&
-    Math.abs(prev.resolutionHz - frame.resolutionHz) < 0.08;
+    Math.abs(prev.sampleRateHz - frame.sampleRateHz) < Math.max(4, frame.sampleRateHz * 0.15);
 
-  const alpha = 0.28; // Smooths random frame-to-frame noise without locking upward spikes
+  const alpha = 0.32;
   const amplitudesAU = new Array<number>(numBins);
 
   for (let k = 0; k < numBins; k++) {
@@ -239,7 +271,8 @@ export function updateSpectrumMeasurement(
     nyquistHz: frame.nyquistHz,
     resolutionHz: frame.resolutionHz,
     periodSec: frame.periodSec,
-    samplesUsed: frame.fftSize,
+    samplesUsed: frame.windowSamples,
+    fftSize: frame.fftSize,
     sensorSource: frame.sensorSource,
     axisUsed: frame.axisUsed,
     frameCount: canAverageWithPrev && prev ? prev.frameCount + 1 : 1,

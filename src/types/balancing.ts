@@ -23,14 +23,15 @@ export interface LiveSpectrumFrame {
 }
 
 export interface SpectrumMeasurement {
-  frequenciesHz: number[]; // Native FFT frequency bins (0 .. nyquistHz at resolutionHz steps)
-  amplitudesAU: number[]; // Steady low-variance averaged 1024-sample FFT magnitude (AU)
-  liveAmplitudesAU: number[]; // Most recent single 1024-sample FFT frame (AU)
+  frequenciesHz: number[]; // Fine FFT display frequency bins (0 .. nyquistHz)
+  amplitudesAU: number[]; // Steady low-variance averaged FFT magnitude (AU)
+  liveAmplitudesAU: number[]; // Most recent FFT frame (AU)
   sampleRateHz: number; // Acquisition rate (Hz)
   nyquistHz: number; // Nyquist frequency (Hz)
-  resolutionHz: number; // Frequency resolution df = 1 / periodSec (Hz)
+  resolutionHz: number; // True spectral resolution df = 1 / periodSec (Hz)
   periodSec: number; // Exact time window of the N samples used (s)
-  samplesUsed: number; // Exact sample count used per FFT (1024)
+  samplesUsed: number; // Real accelerometer samples used in window (e.g. 128/256 at 60Hz, 1024 at 411Hz)
+  fftSize: number; // Radix-2 FFT length (zero-padded to 1024 for smooth peak crest interpolation)
   sensorSource: string;
   axisUsed: SensorAxis;
   frameCount: number;

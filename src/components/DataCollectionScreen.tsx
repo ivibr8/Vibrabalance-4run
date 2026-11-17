@@ -159,24 +159,32 @@ export const DataCollectionScreen: React.FC<Props> = ({
   onNextScreen,
   onPrevScreen,
 }) => {
-  // Phyphox-style default 0-200 Hz view, with zoomed 60 Hz & 100 Hz options
-  const [rangeHz, setRangeHz] = useState<60 | 100 | 200>(200);
-  // Selected bin index on native FFT grid (never auto-selected)
+  // Auto-adapts to browser Nyquist (e.g. 0-30 Hz at 60 Hz Chrome) or 0-200 Hz at 411 Hz, unless user picks manually
+  const [rangeHz, setRangeHz] = useState<30 | 60 | 100 | 200>(200);
+  const [hasManualRange, setHasManualRange] = useState<boolean>(false);
+  // Selected bin index on FFT grid (never auto-selected)
   const [selectedBinIdx, setSelectedBinIdx] = useState<number | null>(null);
   const [optionalRpm, setOptionalRpm] = useState<string>(
     config.nominalRpm > 0 ? String(config.nominalRpm) : ''
   );
 
-  // Reset selected cursor when switching runs or clearing spectrum
+  // Reset selected cursor & auto-range when switching runs or clearing spectrum
   useEffect(() => {
     setSelectedBinIdx(null);
+    setHasManualRange(false);
   }, [run.type]);
 
   useEffect(() => {
     if (!spectrum) {
       setSelectedBinIdx(null);
+      setHasManualRange(false);
+    } else if (!hasManualRange) {
+      if (spectrum.nyquistHz < 38) setRangeHz(30);
+      else if (spectrum.nyquistHz < 70) setRangeHz(60);
+      else if (spectrum.nyquistHz < 120) setRangeHz(100);
+      else setRangeHz(200);
     }
-  }, [spectrum]);
+  }, [spectrum, hasManualRange]);
 
   const refFreqHz = useMemo(() => {
     const rpm = parseFloat(optionalRpm);
@@ -229,12 +237,13 @@ export const DataCollectionScreen: React.FC<Props> = ({
 
     const tappedFreq = ((svgX - padLeft) / plotWidth) * displayMaxHz;
 
-    // Snap gently to highest local peak within ±2.0 Hz of tap for easy mobile selection
+    // Snap gently to highest local peak within ±1.2 Hz (zoomed) or ±2.0 Hz of tap for easy mobile selection
+    const snapRadiusHz = displayMaxHz <= 35 ? 1.2 : 2.0;
     let bestIdx = -1;
     let bestAmp = -1;
     for (const idx of visibleIndices) {
       const f = spectrum.frequenciesHz[idx];
-      if (f >= 1.5 && Math.abs(f - tappedFreq) <= 2.0) {
+      if (f >= 1.5 && Math.abs(f - tappedFreq) <= snapRadiusHz) {
         const amp = spectrum.amplitudesAU[idx] ?? 0;
         if (amp > bestAmp) {
           bestAmp = amp;
@@ -248,9 +257,13 @@ export const DataCollectionScreen: React.FC<Props> = ({
       return;
     }
 
+    const binStepHz =
+      spectrum.frequenciesHz.length > 1
+        ? spectrum.frequenciesHz[1] - spectrum.frequenciesHz[0]
+        : Math.max(0.05, spectrum.resolutionHz);
     const fallbackIdx = Math.min(
       spectrum.frequenciesHz.length - 1,
-      Math.max(1, Math.round(tappedFreq / Math.max(0.05, spectrum.resolutionHz)))
+      Math.max(1, Math.round(tappedFreq / Math.max(0.02, binStepHz)))
     );
     setSelectedBinIdx(fallbackIdx);
   };
@@ -284,15 +297,22 @@ export const DataCollectionScreen: React.FC<Props> = ({
   const activeAxisLabel =
     config.sensorAxis === 'triaxial' ? '3D' : config.sensorAxis.toUpperCase();
 
+  const binStepHz =
+    spectrum && spectrum.frequenciesHz.length > 1
+      ? spectrum.frequenciesHz[1] - spectrum.frequenciesHz[0]
+      : 0.4;
+
   const xTicks =
-    rangeHz === 60
+    rangeHz === 30
+      ? [0, 5, 10, 15, 20, 25, 30]
+      : rangeHz === 60
       ? [0, 10, 20, 30, 40, 50, 60]
       : rangeHz === 100
       ? [0, 20, 40, 60, 80, 100]
       : [0, 40, 80, 120, 160, 200];
 
   const nyquistLimitedBelowSpan =
-    spectrum !== null && spectrum.nyquistHz > 5 && spectrum.nyquistHz < displayMaxHz - 1;
+    spectrum !== null && spectrum.nyquistHz > 5 && spectrum.nyquistHz < displayMaxHz - 0.5;
 
   const bufferPct = bufferProgress
     ? Math.min(100, Math.round((bufferProgress.collected / bufferProgress.target) * 100))
@@ -407,13 +427,16 @@ export const DataCollectionScreen: React.FC<Props> = ({
               <span>Clear</span>
             </button>
 
-            {/* Range Toggle: 60 Hz, 100 Hz, 200 Hz */}
+            {/* Range Toggle: 30 Hz, 60 Hz, 100 Hz, 200 Hz */}
             <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl text-xs">
-              {([60, 100, 200] as const).map((hz) => (
+              {([30, 60, 100, 200] as const).map((hz) => (
                 <button
                   key={hz}
                   type="button"
-                  onClick={() => setRangeHz(hz)}
+                  onClick={() => {
+                    setHasManualRange(true);
+                    setRangeHz(hz);
+                  }}
                   className={`px-2.5 py-1.5 rounded-lg font-mono text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
                     rangeHz === hz
                       ? 'bg-white text-slate-900 font-bold shadow-xs'
@@ -448,12 +471,15 @@ export const DataCollectionScreen: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Phyphox Measurement Parameters Strip */}
+        {/* Measurement Parameters Strip */}
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono tabular-nums text-slate-600 border-b border-slate-200 pb-2.5">
           {spectrum ? (
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
               <span>
                 Samples: <strong className="text-slate-900">{spectrum.samplesUsed}</strong>
+                {spectrum.fftSize > spectrum.samplesUsed && (
+                  <span className="text-slate-400"> ({spectrum.fftSize}-pt FFT)</span>
+                )}
               </span>
               <span>
                 Period: <strong className="text-slate-900">{spectrum.periodSec.toFixed(2)} s</strong>
@@ -472,20 +498,20 @@ export const DataCollectionScreen: React.FC<Props> = ({
           ) : (
             <span>
               {isStreaming && bufferProgress
-                ? `Buffering 1024-sample window: ${bufferProgress.collected} / ${bufferProgress.target}${
+                ? `Buffering FFT window: ${bufferProgress.collected} / ${bufferProgress.target}${
                     bufferProgress.estimatedRateHz
                       ? ` · ${Math.round(bufferProgress.estimatedRateHz)} Hz`
                       : ''
                   }`
                 : isSimulatorMode
                 ? 'Simulator ready (411 Hz · 1024 samples · 0.40 Hz res) · Press Start Spectrum'
-                : 'Press Start Spectrum, hold phone steady for ~3s on bearing, then Stop & Freeze to tap peak'}
+                : 'Press Start Spectrum (~2 s to first display), hold phone steady on bearing, then Stop & Freeze'}
             </span>
           )}
           <span className="text-cyan-700 font-sans font-semibold">
             {isStreaming
               ? spectrum
-                ? '● Live 1024-pt FFT'
+                ? `● Live ${spectrum.fftSize}-pt FFT`
                 : '● Collecting Window...'
               : spectrum
               ? 'Spectrum Frozen'
@@ -511,8 +537,8 @@ export const DataCollectionScreen: React.FC<Props> = ({
               />
               <p className="text-sm font-semibold text-slate-700">
                 {isStreaming
-                  ? 'Collecting Full 1,024-Sample Window...'
-                  : `Acceleration Spectrum (0 – ${displayMaxHz} Hz · 1024 samples)`}
+                  ? 'Collecting Initial FFT Window...'
+                  : `Acceleration Spectrum (0 – ${displayMaxHz} Hz)`}
               </p>
 
               {isStreaming && bufferProgress && (
@@ -534,7 +560,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
 
               {!isStreaming && (
                 <p className="text-xs text-slate-500 max-w-md">
-                  Hold your phone steady against the bearing housing, tap <strong>Start Spectrum</strong> to acquire full 1,024-sample FFT windows, then tap <strong>Stop &amp; Freeze</strong> and remove the phone to select the 1X peak.
+                  Hold your phone steady against the bearing housing, tap <strong>Start Spectrum</strong> (~2 s to first display, refines up to ~4 s), then tap <strong>Stop &amp; Freeze</strong> and remove the phone to select the 1X peak.
                 </p>
               )}
             </div>
@@ -799,16 +825,15 @@ export const DataCollectionScreen: React.FC<Props> = ({
           )}
         </div>
 
-        {/* Browser Sample Rate Notice if Hardware Browser Rate < 90 Hz */}
-        {spectrum && spectrum.sampleRateHz < 90 && (
-          <div className="bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5 flex items-start gap-2 text-xs text-amber-900">
+        {/* Browser Sample Rate Notice if Hardware Browser Rate < 120 Hz */}
+        {spectrum && spectrum.sampleRateHz < 120 && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5 flex items-start gap-2.5 text-xs text-amber-900 leading-relaxed">
             <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-            <span>
-              <strong>Browser Sensor Limit:</strong> Your browser is delivering{' '}
-              <strong className="font-mono">{Math.round(spectrum.sampleRateHz)} Hz</strong>{' '}
-              (Nyquist {Math.round(spectrum.nyquistHz)} Hz), whereas native apps like Phyphox read hardware directly at ~411 Hz. Higher frequencies above{' '}
-              {Math.round(spectrum.nyquistHz)} Hz can alias down into lower bins inside throttled mobile browsers.
-            </span>
+            <div>
+              <strong>Browser Sensor Limit ({Math.round(spectrum.sampleRateHz)} Hz · Nyquist {Math.round(spectrum.nyquistHz)} Hz):</strong>{' '}
+              Chrome &amp; Safari sandbox all web pages to ~60 Hz (~30 Hz max unaliased frequency), whereas native apps like Phyphox hold Android&apos;s <code className="font-mono text-[11px] bg-amber-100/80 px-1 rounded">HIGH_SAMPLING_RATE_SENSORS</code> permission for ~411 Hz (206 Hz Nyquist).
+              Higher harmonics (e.g. 2X/3X) fold down into lower bins here — or you can enter Phyphox&apos;s 1X peak value directly in <strong>Manual Override (AU)</strong> below.
+            </div>
           </div>
         )}
 
@@ -820,7 +845,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
               <span>
                 {selectedFreqHz === null
                   ? 'Tap the peak at the running speed frequency on the spectrum after removing the phone to select your 1X value'
-                  : `Selected 1X Peak @ ${selectedFreqHz.toFixed(1)} Hz (${Math.round(selectedFreqHz * 60)} RPM)`}
+                  : `Selected 1X Peak @ ${selectedFreqHz.toFixed(2)} Hz (${Math.round(selectedFreqHz * 60)} RPM)`}
               </span>
             </div>
 
@@ -832,14 +857,14 @@ export const DataCollectionScreen: React.FC<Props> = ({
                   className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-xs font-mono font-bold text-slate-700 flex items-center cursor-pointer"
                 >
                   <ChevronLeft className="w-3.5 h-3.5" />
-                  <span>{spectrum.resolutionHz.toFixed(2)}Hz</span>
+                  <span>{binStepHz.toFixed(2)}Hz</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => handleStepBin(1)}
                   className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-xs font-mono font-bold text-slate-700 flex items-center cursor-pointer"
                 >
-                  <span>{spectrum.resolutionHz.toFixed(2)}Hz</span>
+                  <span>{binStepHz.toFixed(2)}Hz</span>
                   <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -852,7 +877,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
                 <div>
                   <span className="text-[11px] text-slate-500 block">Selected Frequency</span>
                   <span className="text-xl font-bold font-mono tabular-nums text-slate-900">
-                    {selectedFreqHz.toFixed(1)} Hz
+                    {selectedFreqHz.toFixed(2)} Hz
                   </span>
                 </div>
                 <div>

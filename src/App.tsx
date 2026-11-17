@@ -226,7 +226,7 @@ export default function App() {
     activeRunRef.current = runType;
     setBufferProgress({
       collected: 0,
-      target: 1024,
+      target: isSimulatorMode ? 1024 : 128,
       estimatedRateHz: null,
       sensorSource: isSimulatorMode ? 'Simulator (411 Hz)' : 'Sensor',
     });
@@ -514,7 +514,7 @@ export default function App() {
 
       {/* Clean Footer */}
       <footer className="border-t border-slate-300 bg-white px-6 py-3.5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600 shrink-0">
-        <span>VibraBalance 4-Run · 1024-Sample Smartphone FFT Balancing (AU)</span>
+        <span>VibraBalance 4-Run · Smartphone FFT Balancing (AU)</span>
         <button
           type="button"
           onClick={() => setIsInstallModalOpen(true)}

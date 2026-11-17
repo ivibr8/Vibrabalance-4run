@@ -125,7 +125,7 @@ export const MethodologyScreen: React.FC<Props> = ({
       {/* Clean Overview Header */}
       <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-5 sm:p-6 space-y-2">
         <p className="text-xs font-mono text-slate-500">
-          Single-Plane No-Phase Balancing · 1024-Sample FFT Spectrum (AU)
+          Single-Plane No-Phase Balancing · Live Smartphone FFT Spectrum (AU)
         </p>
         <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
           Four-Run Dynamic Rotor Balancing

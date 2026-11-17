@@ -244,7 +244,7 @@ export class SensorManager {
         if (!this.isStreaming) return;
         settled = true;
 
-        if (accelBuffer.length > dmBuffer.length * 1.1 && accelBuffer.length >= 10) {
+        if (accelBuffer.length >= dmBuffer.length * 0.9 && accelBuffer.length >= 10) {
           if (this.motionHandler) {
             window.removeEventListener('devicemotion', this.motionHandler);
             this.motionHandler = null;
