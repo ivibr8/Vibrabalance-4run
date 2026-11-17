@@ -121,7 +121,7 @@ const BLANK_RUNS = (cfg: BalancingConfig): RunData[] => [
 
 export default function App() {
   // 0: Setup, 1..4: Runs O..O+T3, 5: Polar Plot & Solution
-  const [currentScreen, setCurrentScreen] = useState<number>(5);
+  const [currentScreen, setCurrentScreen] = useState<number>(0);
   const [config, setConfig] = useState<BalancingConfig>(INITIAL_CONFIG);
   const [runs, setRuns] = useState<RunData[]>(INITIAL_RUNS);
   const [lockedAxis, setLockedAxis] = useState<SensorAxis | null>(null);
