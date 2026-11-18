@@ -3,19 +3,23 @@ import {
   BalancingCalculationResult,
   BalancingConfig,
   BufferProgress,
+  FftSampleCount,
   RunData,
   RunType,
   SensorAxis,
+  SingleAxis,
   SpectrumMeasurement,
   VibrationSample,
 } from './types/balancing';
 import {
+  DEFAULT_FFT_SAMPLE_COUNT,
   computeBufferProgress,
   computeLiveSpectrumFrame,
+  normalizeSingleAxis,
   updateSpectrumMeasurement,
 } from './utils/fft';
 import { solveFourRunNoPhase } from './utils/balancingSolver';
-import { SensorManager } from './services/sensorManager';
+import { SensorManager, StreamDiagnostics } from './services/sensorManager';
 import { MethodologyScreen } from './components/MethodologyScreen';
 import { DataCollectionScreen } from './components/DataCollectionScreen';
 import { PolarPlotScreen } from './components/PolarPlotScreen';
@@ -125,11 +129,14 @@ const BLANK_RUNS = (cfg: BalancingConfig): RunData[] => [
 ];
 
 export default function App() {
-  // 0: Setup, 1..4: Runs O..O+T3, 5: Polar Plot & Solution
+  // 0: Setup (Page 1), 1..4: Runs O..O+T3, 5: Polar Plot & Solution
   const [currentScreen, setCurrentScreen] = useState<number>(0);
   const [config, setConfig] = useState<BalancingConfig>(INITIAL_CONFIG);
   const [runs, setRuns] = useState<RunData[]>(INITIAL_RUNS);
-  const [lockedAxis, setLockedAxis] = useState<SensorAxis | null>(null);
+  const [lockedAxis, setLockedAxis] = useState<SingleAxis | null>(null);
+  const [fftSampleCount, setFftSampleCount] = useState<FftSampleCount>(
+    DEFAULT_FFT_SAMPLE_COUNT
+  );
 
   const [isSimulatorMode, setIsSimulatorMode] = useState<boolean>(false);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
@@ -142,13 +149,19 @@ export default function App() {
   const [isInstallModalOpen, setIsInstallModalOpen] = useState<boolean>(false);
 
   const sensorManagerRef = useRef<SensorManager | null>(null);
-  const activeAxisRef = useRef<SensorAxis>(config.sensorAxis);
+  const activeAxisRef = useRef<SingleAxis>(normalizeSingleAxis(config.sensorAxis));
   const activeRunRef = useRef<RunType>('O');
+  const fftSampleCountRef = useRef<FftSampleCount>(fftSampleCount);
   const isStreamingRef = useRef<boolean>(false);
+  const recentTopPeaksRef = useRef<{ [key in RunType]?: number[] }>({});
 
   useEffect(() => {
-    activeAxisRef.current = lockedAxis ?? config.sensorAxis;
+    activeAxisRef.current = lockedAxis ?? normalizeSingleAxis(config.sensorAxis);
   }, [lockedAxis, config.sensorAxis]);
+
+  useEffect(() => {
+    fftSampleCountRef.current = fftSampleCount;
+  }, [fftSampleCount]);
 
   useEffect(() => {
     if (currentScreen >= 1 && currentScreen <= 4) {
@@ -158,21 +171,58 @@ export default function App() {
 
   useEffect(() => {
     sensorManagerRef.current = new SensorManager({
-      onSamplesBuffer: (samples: VibrationSample[], sourceLabel: string) => {
+      onSamplesBuffer: (
+        samples: VibrationSample[],
+        sourceLabel: string,
+        diagnostics?: StreamDiagnostics
+      ) => {
         if (!isStreamingRef.current) return;
-        const progress = computeBufferProgress(samples, sourceLabel);
+
+        if (diagnostics?.noSamplesTimeout) {
+          setStreamError(
+            'Sensor data unavailable: no accelerometer readings arrived. Verify motion permissions and HTTPS connection.'
+          );
+        } else if (diagnostics?.isStalled) {
+          setStreamError(
+            `Sensor interruption detected: no new readings for ${(
+              diagnostics.lastSampleAgeMs / 1000
+            ).toFixed(1)} s.`
+          );
+        } else {
+          setStreamError(null);
+        }
+
+        const targetN = fftSampleCountRef.current;
+        const progress = computeBufferProgress(
+          samples,
+          targetN,
+          sourceLabel,
+          diagnostics?.isStalled ?? false
+        );
         setBufferProgress(progress);
+
         if (progress.estimatedRateHz) {
           setLastSampleRate(Math.round(progress.estimatedRateHz));
         }
 
+        const runType = activeRunRef.current;
+        const recentPeaks = recentTopPeaksRef.current[runType] ?? [];
         const frame = computeLiveSpectrumFrame(
           samples,
           activeAxisRef.current,
-          sourceLabel
+          targetN,
+          sourceLabel,
+          diagnostics?.isStalled ?? false,
+          recentPeaks
         );
+
         if (frame) {
-          const runType = activeRunRef.current;
+          let frameTop = 0;
+          for (let i = 1; i < frame.amplitudesMs2.length; i++) {
+            if (frame.amplitudesMs2[i] > frameTop) frameTop = frame.amplitudesMs2[i];
+          }
+          recentTopPeaksRef.current[runType] = [...recentPeaks.slice(-5), frameTop];
+
           setLastSampleRate(Math.round(frame.sampleRateHz));
           setSpectrumByRun((prev) => ({
             ...prev,
@@ -205,6 +255,76 @@ export default function App() {
     return solveFourRunNoPhase(runs, config);
   }, [runs, config]);
 
+  // Cross-run consistency audit (axis, FFT sample count, running-speed frequency)
+  const consistencyWarnings = useMemo<string[]>(() => {
+    const warnings: string[] = [];
+    const currentAxis = lockedAxis ?? normalizeSingleAxis(config.sensorAxis);
+
+    const measuredRuns = runs.filter(
+      (r) => r.isKept && (r.axisUsed !== undefined || r.fftSampleCountUsed !== undefined)
+    );
+
+    const usedAxes = new Set(
+      measuredRuns.map((r) => r.axisUsed).filter((a): a is SingleAxis => Boolean(a))
+    );
+    if (usedAxes.size > 1) {
+      warnings.push(
+        `Inconsistent accelerometer axis across runs (${Array.from(usedAxes)
+          .map((a) => a.toUpperCase())
+          .join(', ')}). All four runs must use the exact same axis.`
+      );
+    } else if (usedAxes.size === 1) {
+      const prevAxis = Array.from(usedAxes)[0];
+      if (prevAxis !== currentAxis) {
+        warnings.push(
+          `Selected axis (${currentAxis.toUpperCase()}) differs from prior run axis (${prevAxis.toUpperCase()}). Switch back to ${prevAxis.toUpperCase()} for consistent results.`
+        );
+      }
+    }
+
+    const usedCounts = new Set(
+      measuredRuns
+        .map((r) => r.fftSampleCountUsed)
+        .filter((c): c is FftSampleCount => Boolean(c))
+    );
+    if (usedCounts.size > 1) {
+      warnings.push(
+        `Inconsistent FFT sample counts across runs (${Array.from(usedCounts).join(
+          ', '
+        )}). All 4 runs should use identical sample counts.`
+      );
+    } else if (usedCounts.size === 1) {
+      const prevCount = Array.from(usedCounts)[0];
+      if (prevCount !== fftSampleCount) {
+        warnings.push(
+          `Selected FFT sample count (${fftSampleCount}) differs from prior run (${prevCount}). Match ${prevCount} samples across all runs.`
+        );
+      }
+    }
+
+    const freqRuns = runs.filter((r) => r.isKept && r.frequencyHz > 0);
+    if (freqRuns.length >= 2) {
+      const freqs = freqRuns.map((r) => r.frequencyHz);
+      const minF = Math.min(...freqs);
+      const maxF = Math.max(...freqs);
+      const avgF = freqs.reduce((a, b) => a + b, 0) / freqs.length;
+      if (maxF - minF > Math.max(1.5, avgF * 0.05)) {
+        warnings.push(
+          `Running-speed 1X frequency varied across runs (${minF.toFixed(
+            2
+          )}–${maxF.toFixed(2)} Hz). Verify constant machine speed across O, T1, T2, and T3.`
+        );
+      }
+    }
+
+    return warnings;
+  }, [runs, config.sensorAxis, lockedAxis, fftSampleCount]);
+
+  const referenceRunOFreqHz = useMemo(() => {
+    const runO = runs.find((r) => r.type === 'O');
+    return runO && runO.isKept && runO.frequencyHz > 0 ? runO.frequencyHz : null;
+  }, [runs]);
+
   const stopLiveStream = () => {
     isStreamingRef.current = false;
     sensorManagerRef.current?.stopLiveStream();
@@ -222,16 +342,24 @@ export default function App() {
     const mgr = sensorManagerRef.current;
     if (!mgr) return;
 
-    setStreamError(null);
+    const singleAxis = lockedAxis ?? normalizeSingleAxis(config.sensorAxis);
+    activeAxisRef.current = singleAxis;
     activeRunRef.current = runType;
+    recentTopPeaksRef.current[runType] = [];
+
+    setStreamError(null);
+    setSpectrumByRun((prev) => ({ ...prev, [runType]: null }));
     setBufferProgress({
       collected: 0,
-      target: isSimulatorMode ? 1024 : 128,
+      target: fftSampleCount,
       estimatedRateHz: null,
-      sensorSource: isSimulatorMode ? 'Simulator (411 Hz)' : 'Sensor',
+      elapsedSec: 0,
+      isStalled: false,
+      irregularDuringFill: false,
+      droppedDuringFill: 0,
+      sensorSource: isSimulatorMode ? 'Simulator (411 Hz)' : 'Accelerometer',
     });
 
-    // Must be called directly inside user tap handler on iOS Safari
     if (!isSimulatorMode && mgr.isPermissionRequired()) {
       const granted = await mgr.requestPermission();
       if (!granted) {
@@ -242,15 +370,34 @@ export default function App() {
 
     isStreamingRef.current = true;
     setIsStreaming(true);
-    mgr.startLiveStream(
-      isSimulatorMode ? { runType, baseRpm: config.nominalRpm } : undefined
-    );
+    mgr.startLiveStream({
+      axis: singleAxis,
+      simulationConfig: isSimulatorMode
+        ? { runType, baseRpm: config.nominalRpm }
+        : undefined,
+    });
   };
 
   const handleClearSpectrum = (runType: RunType) => {
     sensorManagerRef.current?.clearSamples();
+    recentTopPeaksRef.current[runType] = [];
     setBufferProgress(null);
+    setStreamError(null);
     setSpectrumByRun((prev) => ({ ...prev, [runType]: null }));
+  };
+
+  const handleChangeFftSampleCount = (
+    runType: RunType,
+    newCount: FftSampleCount
+  ) => {
+    if (newCount === fftSampleCount) return;
+    if (isStreaming) stopLiveStream();
+    sensorManagerRef.current?.clearSamples();
+    recentTopPeaksRef.current[runType] = [];
+    setBufferProgress(null);
+    setStreamError(null);
+    setSpectrumByRun((prev) => ({ ...prev, [runType]: null }));
+    setFftSampleCount(newCount);
   };
 
   const handleImportSpectrum = (
@@ -269,11 +416,12 @@ export default function App() {
 
   const handleKeepMeasurement = (
     runType: RunType,
-    ampAU: number,
-    frequencyHz: number
+    ampMs2: number,
+    frequencyHz: number,
+    meta?: { sampleRateHz?: number; samplesUsed?: number; axisUsed?: SingleAxis }
   ) => {
     stopLiveStream();
-    const axisToLock = lockedAxis ?? config.sensorAxis;
+    const axisToLock = meta?.axisUsed ?? lockedAxis ?? normalizeSingleAxis(config.sensorAxis);
     setLockedAxis(axisToLock);
 
     setRuns((prev) =>
@@ -281,27 +429,33 @@ export default function App() {
         r.type === runType
           ? {
               ...r,
-              amplitudeMils: Math.round(ampAU * 1000) / 1000,
+              amplitudeMils: Math.round(ampMs2 * 1000) / 1000,
               frequencyHz: Math.round(frequencyHz * 100) / 100,
               runningRpm: Math.round(frequencyHz * 60),
               isKept: true,
               measuredAt: new Date().toLocaleTimeString(),
+              axisUsed: axisToLock,
+              fftSampleCountUsed:
+                (meta?.samplesUsed as FftSampleCount | undefined) ?? fftSampleCount,
+              sampleRateUsedHz: meta?.sampleRateHz,
             }
           : r
       )
     );
   };
 
-  const handleUpdateManualAmp = (runType: RunType, ampAU: number) => {
+  const handleUpdateManualAmp = (runType: RunType, ampVal: number) => {
+    const activeAxis = lockedAxis ?? normalizeSingleAxis(config.sensorAxis);
     setRuns((prev) =>
       prev.map((r) =>
         r.type === runType
           ? {
               ...r,
-              amplitudeMils: ampAU,
+              amplitudeMils: ampVal,
               frequencyHz: r.frequencyHz || config.nominalRpm / 60,
               runningRpm: r.runningRpm || config.nominalRpm,
-              isKept: ampAU > 0,
+              isKept: ampVal > 0,
+              axisUsed: activeAxis,
             }
           : r
       )
@@ -322,13 +476,14 @@ export default function App() {
 
   const handleUpdateAxis = (newAxis: SensorAxis) => {
     if (lockedAxis !== null) return;
-    setConfig((prev) => ({ ...prev, sensorAxis: newAxis }));
+    setConfig((prev) => ({ ...prev, sensorAxis: normalizeSingleAxis(newAxis) }));
   };
 
   const handleStartFreshProcedure = () => {
     stopLiveStream();
     setLockedAxis(null);
     setSpectrumByRun({});
+    recentTopPeaksRef.current = {};
     setBufferProgress(null);
     setStreamError(null);
     setRuns(BLANK_RUNS(config));
@@ -339,10 +494,12 @@ export default function App() {
     stopLiveStream();
     setLockedAxis(null);
     setSpectrumByRun({});
+    recentTopPeaksRef.current = {};
     setBufferProgress(null);
     setStreamError(null);
     setRuns(BLANK_RUNS(INITIAL_CONFIG));
     setConfig(INITIAL_CONFIG);
+    setFftSampleCount(DEFAULT_FFT_SAMPLE_COUNT);
     setCurrentScreen(0);
   };
 
@@ -350,12 +507,16 @@ export default function App() {
     stopLiveStream();
     setLockedAxis(null);
     setSpectrumByRun({});
+    recentTopPeaksRef.current = {};
     setBufferProgress(null);
     setStreamError(null);
     setRuns(INITIAL_RUNS);
     setConfig(INITIAL_CONFIG);
     setCurrentScreen(5);
   };
+
+  const effectiveSingleAxis: SingleAxis =
+    lockedAxis ?? normalizeSingleAxis(config.sensorAxis);
 
   const screenSteps = [
     { id: 0, label: 'Setup' },
@@ -441,11 +602,9 @@ export default function App() {
           {' · '}O+T2: <strong className="text-slate-900">{runs[2].amplitudeMils}</strong>
           {' · '}O+T3: <strong className="text-slate-900">{runs[3].amplitudeMils}</strong>
           {' · '}Axis:{' '}
-          <strong className="text-slate-900">
-            {(lockedAxis ?? config.sensorAxis) === 'triaxial'
-              ? '3D'
-              : (lockedAxis ?? config.sensorAxis).toUpperCase()}
-          </strong>
+          <strong className="text-slate-900">{effectiveSingleAxis.toUpperCase()}</strong>
+          {' · '}N:{' '}
+          <strong className="text-slate-900">{fftSampleCount}</strong>
         </div>
 
         {solution.isValid && (
@@ -485,24 +644,31 @@ export default function App() {
                 key={currentRun.type}
                 run={currentRun}
                 runIndex={runIdx}
-                config={{ ...config, sensorAxis: lockedAxis ?? config.sensorAxis }}
+                config={{ ...config, sensorAxis: effectiveSingleAxis }}
+                selectedSingleAxis={effectiveSingleAxis}
                 isAxisLocked={lockedAxis !== null}
+                fftSampleCount={fftSampleCount}
                 isStreaming={isStreaming}
                 spectrum={spectrumByRun[currentRun.type] || null}
                 bufferProgress={bufferProgress}
                 streamError={streamError}
                 isSimulatorMode={isSimulatorMode}
+                referenceRunOFreqHz={referenceRunOFreqHz}
+                consistencyWarnings={consistencyWarnings}
+                onChangeFftSampleCount={(newCount) =>
+                  handleChangeFftSampleCount(currentRun.type, newCount)
+                }
                 onStartLiveStream={() => handleStartLiveStream(currentRun.type)}
                 onStopLiveStream={stopLiveStream}
                 onClearSpectrum={() => handleClearSpectrum(currentRun.type)}
                 onImportSpectrum={(imported) =>
                   handleImportSpectrum(currentRun.type, imported)
                 }
-                onKeepMeasurement={(ampAU, freqHz) =>
-                  handleKeepMeasurement(currentRun.type, ampAU, freqHz)
+                onKeepMeasurement={(ampMs2, freqHz, meta) =>
+                  handleKeepMeasurement(currentRun.type, ampMs2, freqHz, meta)
                 }
-                onUpdateManualAmp={(ampAU) =>
-                  handleUpdateManualAmp(currentRun.type, ampAU)
+                onUpdateManualAmp={(ampVal) =>
+                  handleUpdateManualAmp(currentRun.type, ampVal)
                 }
                 onUpdatePhaseAngle={(deg) =>
                   handleUpdatePhaseAngle(
@@ -531,7 +697,7 @@ export default function App() {
 
       {/* Clean Footer */}
       <footer className="border-t border-slate-300 bg-white px-6 py-3.5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600 shrink-0">
-        <span>VibraBalance 4-Run · Smartphone FFT Balancing (AU)</span>
+        <span>VibraBalance 4-Run · Single-Axis Smartphone FFT Balancing</span>
         <button
           type="button"
           onClick={() => setIsInstallModalOpen(true)}

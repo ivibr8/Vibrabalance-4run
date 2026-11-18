@@ -2,11 +2,18 @@ import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   BalancingConfig,
   BufferProgress,
+  FftSampleCount,
   RunData,
   SensorAxis,
+  SingleAxis,
   SpectrumMeasurement,
 } from '../types/balancing';
-import { parsePhyphoxCsv } from '../utils/fft';
+import {
+  FFT_SAMPLE_OPTIONS,
+  MIN_VALID_SPECTRUM_HZ,
+  computePeakPickReadout,
+  parsePhyphoxCsv,
+} from '../utils/fft';
 import {
   Activity,
   AlertTriangle,
@@ -17,10 +24,12 @@ import {
   ChevronRight,
   Crosshair,
   Lock,
+  Pause,
   Play,
   RotateCcw,
-  Square,
   Upload,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 
 interface NumericInputProps {
@@ -124,17 +133,26 @@ interface Props {
   run: RunData;
   runIndex: number;
   config: BalancingConfig;
+  selectedSingleAxis: SingleAxis;
   isAxisLocked: boolean;
+  fftSampleCount: FftSampleCount;
   isStreaming: boolean;
   spectrum: SpectrumMeasurement | null;
   bufferProgress: BufferProgress | null;
   streamError: string | null;
   isSimulatorMode: boolean;
+  referenceRunOFreqHz: number | null;
+  consistencyWarnings: string[];
+  onChangeFftSampleCount: (count: FftSampleCount) => void;
   onStartLiveStream: () => void;
   onStopLiveStream: () => void;
   onClearSpectrum: () => void;
   onImportSpectrum: (spectrum: SpectrumMeasurement) => void;
-  onKeepMeasurement: (ampAU: number, frequencyHz: number) => void;
+  onKeepMeasurement: (
+    ampMs2: number,
+    frequencyHz: number,
+    meta?: { sampleRateHz?: number; samplesUsed?: number; axisUsed?: SingleAxis }
+  ) => void;
   onUpdateManualAmp: (ampAU: number) => void;
   onUpdatePhaseAngle: (deg: number) => void;
   onUpdateAxis: (axis: SensorAxis) => void;
@@ -146,12 +164,17 @@ export const DataCollectionScreen: React.FC<Props> = ({
   run,
   runIndex,
   config,
+  selectedSingleAxis,
   isAxisLocked,
+  fftSampleCount,
   isStreaming,
   spectrum,
   bufferProgress,
   streamError,
   isSimulatorMode,
+  referenceRunOFreqHz,
+  consistencyWarnings,
+  onChangeFftSampleCount,
   onStartLiveStream,
   onStopLiveStream,
   onClearSpectrum,
@@ -163,67 +186,101 @@ export const DataCollectionScreen: React.FC<Props> = ({
   onNextScreen,
   onPrevScreen,
 }) => {
-  // Auto-adapts to browser Nyquist (e.g. 0-30 Hz at 60 Hz Chrome) or 0-200 Hz at 411/412 Hz, unless user picks manually
-  const [rangeHz, setRangeHz] = useState<30 | 60 | 100 | 200>(200);
-  const [hasManualRange, setHasManualRange] = useState<boolean>(false);
-  // Selected bin index on FFT grid (never auto-selected)
+  // Horizontal spectrum view window (defaults to requested 0–200 Hz display range)
+  const [xRange, setXRange] = useState<{ min: number; max: number }>({
+    min: 0,
+    max: 200,
+  });
+  // Vertical amplitude zoom multiplier (1 = Auto-fit, 2/4/8 = zoomed in to inspect smaller peaks)
+  const [yZoom, setYZoom] = useState<1 | 2 | 4 | 8>(1);
+
+  // Explicit user-controlled Peak Pick mode state & cursor
+  const [peakPickActive, setPeakPickActive] = useState<boolean>(true);
+  const [useInterpolation, setUseInterpolation] = useState<boolean>(false);
   const [selectedBinIdx, setSelectedBinIdx] = useState<number | null>(null);
+  const [outOfRangeClickMsg, setOutOfRangeClickMsg] = useState<string | null>(null);
+  const [isDraggingCursor, setIsDraggingCursor] = useState<boolean>(false);
+  const [heldIncompleteWarning, setHeldIncompleteWarning] = useState<boolean>(false);
+
   const [csvError, setCsvError] = useState<string | null>(null);
   const csvInputRef = useRef<HTMLInputElement>(null);
+
   const [optionalRpm, setOptionalRpm] = useState<string>(
     config.nominalRpm > 0 ? String(config.nominalRpm) : ''
   );
 
-  // Reset selected cursor & auto-range when switching runs or clearing spectrum
+  // Reset cursor & warnings when switching between runs
   useEffect(() => {
     setSelectedBinIdx(null);
-    setHasManualRange(false);
+    setOutOfRangeClickMsg(null);
+    setHeldIncompleteWarning(false);
+    setXRange({ min: 0, max: 200 });
+    setYZoom(1);
   }, [run.type]);
 
   useEffect(() => {
     if (!spectrum) {
       setSelectedBinIdx(null);
-      setHasManualRange(false);
-    } else if (!hasManualRange) {
-      if (spectrum.nyquistHz < 38) setRangeHz(30);
-      else if (spectrum.nyquistHz < 70) setRangeHz(60);
-      else if (spectrum.nyquistHz < 120) setRangeHz(100);
-      else setRangeHz(200);
+      setOutOfRangeClickMsg(null);
+    } else {
+      setHeldIncompleteWarning(false);
     }
-  }, [spectrum, hasManualRange]);
+  }, [spectrum]);
 
   const refFreqHz = useMemo(() => {
     const rpm = parseFloat(optionalRpm);
     return Number.isFinite(rpm) && rpm > 0 ? rpm / 60 : null;
   }, [optionalRpm]);
 
-  const displayMaxHz = rangeHz;
+  const viewMinHz = xRange.min;
+  const viewMaxHz = xRange.max;
+  const viewSpanHz = Math.max(5, viewMaxHz - viewMinHz);
 
-  const visibleIndices = useMemo(() => {
+  // Strictly plot ONLY valid spectral bins within [viewMinHz, min(viewMaxHz, nyquistHz)]
+  // Never extrapolate or draw invalid spectral data above Nyquist.
+  const plottedIndices = useMemo(() => {
     if (!spectrum) return [];
+    const maxPlottableHz = Math.min(viewMaxHz, spectrum.nyquistHz + 1e-6);
     const idxs: number[] = [];
     for (let i = 0; i < spectrum.frequenciesHz.length; i++) {
-      if (spectrum.frequenciesHz[i] <= displayMaxHz + 1e-6) {
+      const f = spectrum.frequenciesHz[i];
+      if (f >= viewMinHz - 1e-6 && f <= maxPlottableHz) {
         idxs.push(i);
       }
     }
     return idxs;
-  }, [spectrum, displayMaxHz]);
+  }, [spectrum, viewMinHz, viewMaxHz]);
 
-  const yMax = useMemo(() => {
-    if (!spectrum || visibleIndices.length === 0) return 1.0;
+  // Maximum valid bin index <= Nyquist (never selects above Nyquist)
+  const maxValidBinIdx = useMemo(() => {
+    if (!spectrum) return 0;
+    let lastValid = 0;
+    for (let i = 0; i < spectrum.frequenciesHz.length; i++) {
+      if (spectrum.frequenciesHz[i] <= spectrum.nyquistHz + 1e-6) {
+        lastValid = i;
+      }
+    }
+    return lastValid;
+  }, [spectrum]);
+
+  const peakAmpInView = useMemo(() => {
+    if (!spectrum || plottedIndices.length === 0) return 1.0;
     let peak = 0.05;
-    for (const idx of visibleIndices) {
-      const val = spectrum.amplitudesAU[idx] ?? 0;
+    for (const idx of plottedIndices) {
+      const val = spectrum.amplitudesMs2[idx] ?? 0;
       if (val > peak) peak = val;
     }
-    return Math.max(0.2, peak * 1.18);
-  }, [spectrum, visibleIndices]);
+    return peak;
+  }, [spectrum, plottedIndices]);
+
+  const yMax = useMemo(() => {
+    return Math.max(0.05, (peakAmpInView * 1.18) / yZoom);
+  }, [peakAmpInView, yZoom]);
 
   // SVG Layout
-  const svgWidth = 820;
-  const svgHeight = 320;
-  const padLeft = 58;
+  const svgWidth = 840;
+  const svgHeight = 330;
+  const padLeft = 62;
   const padRight = 24;
   const padTop = 26;
   const padBottom = 44;
@@ -231,101 +288,128 @@ export const DataCollectionScreen: React.FC<Props> = ({
   const plotHeight = svgHeight - padTop - padBottom;
 
   const getX = (f: number) =>
-    padLeft + (Math.max(0, Math.min(f, displayMaxHz)) / displayMaxHz) * plotWidth;
+    padLeft +
+    ((Math.max(viewMinHz, Math.min(f, viewMaxHz)) - viewMinHz) / viewSpanHz) * plotWidth;
+
   const getY = (amp: number) =>
     padTop + plotHeight - (Math.max(0, Math.min(amp, yMax)) / yMax) * plotHeight;
 
-  const handleSvgTap = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!spectrum || visibleIndices.length < 3) return;
+  const pickFrequencyFromPointerEvent = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (!spectrum || !peakPickActive || spectrum.frequenciesHz.length < 3) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const svgX = ((e.clientX - rect.left) / rect.width) * svgWidth;
     if (svgX < padLeft || svgX > padLeft + plotWidth) return;
 
-    const tappedFreq = ((svgX - padLeft) / plotWidth) * displayMaxHz;
+    const tappedFreq = viewMinHz + ((svgX - padLeft) / plotWidth) * viewSpanHz;
 
-    // Snap gently to highest local peak near tap for easy mobile selection (scales with bin resolution)
-    const snapRadiusHz = Math.max(
-      displayMaxHz <= 35 ? 1.2 : 2.5,
-      (spectrum.resolutionHz || 1) * 1.15
-    );
-    let bestIdx = -1;
-    let bestAmp = -1;
-    for (const idx of visibleIndices) {
-      const f = spectrum.frequenciesHz[idx];
-      if (f >= 1.5 && Math.abs(f - tappedFreq) <= snapRadiusHz) {
-        const amp = spectrum.amplitudesAU[idx] ?? 0;
-        if (amp > bestAmp) {
-          bestAmp = amp;
-          bestIdx = idx;
-        }
-      }
-    }
-
-    if (bestIdx !== -1) {
-      setSelectedBinIdx(bestIdx);
+    if (tappedFreq > spectrum.nyquistHz + 1e-3) {
+      setOutOfRangeClickMsg(
+        `${tappedFreq.toFixed(1)} Hz is above the actual Nyquist frequency (${spectrum.nyquistHz.toFixed(
+          2
+        )} Hz). Select a peak within the valid 0 – ${spectrum.nyquistHz.toFixed(1)} Hz range.`
+      );
       return;
     }
 
-    const binStepHz =
+    setOutOfRangeClickMsg(null);
+    const df =
       spectrum.frequenciesHz.length > 1
         ? spectrum.frequenciesHz[1] - spectrum.frequenciesHz[0]
-        : Math.max(0.05, spectrum.resolutionHz);
-    const fallbackIdx = Math.min(
-      spectrum.frequenciesHz.length - 1,
-      Math.max(1, Math.round(tappedFreq / Math.max(0.02, binStepHz)))
+        : Math.max(0.02, spectrum.resolutionHz);
+
+    // Strictly snap cursor to the nearest valid spectral bin under the operator's touch
+    // (never substitute or jump to an unrelated taller peak).
+    const nearestIdx = Math.max(
+      1,
+      Math.min(maxValidBinIdx, Math.round(tappedFreq / Math.max(0.01, df)))
     );
-    setSelectedBinIdx(fallbackIdx);
+    setSelectedBinIdx(nearestIdx);
   };
 
   const handleStepBin = (delta: number) => {
     if (!spectrum || selectedBinIdx === null) return;
-    const maxVisibleIdx =
-      visibleIndices.length > 0
-        ? visibleIndices[visibleIndices.length - 1]
-        : spectrum.frequenciesHz.length - 1;
-    const nextIdx = Math.max(1, Math.min(maxVisibleIdx, selectedBinIdx + delta));
+    const nextIdx = Math.max(1, Math.min(maxValidBinIdx, selectedBinIdx + delta));
+    setOutOfRangeClickMsg(null);
     setSelectedBinIdx(nextIdx);
   };
 
-  const selectedFreqHz =
-    spectrum && selectedBinIdx !== null
-      ? spectrum.frequenciesHz[selectedBinIdx] ?? null
-      : null;
-  const selectedAmpAU =
-    spectrum && selectedBinIdx !== null
-      ? spectrum.amplitudesAU[selectedBinIdx] ?? null
-      : null;
+  const peakPickReadout = useMemo(() => {
+    if (!spectrum || selectedBinIdx === null) return null;
+    const clampedIdx = Math.min(selectedBinIdx, spectrum.frequenciesHz.length - 1);
+    return computePeakPickReadout(spectrum, clampedIdx, useInterpolation);
+  }, [spectrum, selectedBinIdx, useInterpolation]);
 
-  const axisChoices: { id: SensorAxis; label: string }[] = [
-    { id: 'x', label: 'X' },
-    { id: 'y', label: 'Y' },
-    { id: 'z', label: 'Z' },
-    { id: 'triaxial', label: '3D' },
-  ];
+  const selectedFreqHz = peakPickReadout?.frequencyHz ?? null;
+  const selectedAmpMs2 = peakPickReadout?.amplitudeMs2 ?? null;
+  const isPeakOutsideValidRange =
+    peakPickReadout !== null && !peakPickReadout.isWithinValidRange;
 
-  const activeAxisLabel =
-    config.sensorAxis === 'triaxial' ? '3D' : config.sensorAxis.toUpperCase();
+  // Horizontal X-axis ticks computed nicely for current zoom window
+  const xTicks = useMemo(() => {
+    const step =
+      viewSpanHz <= 20
+        ? 2
+        : viewSpanHz <= 40
+        ? 5
+        : viewSpanHz <= 80
+        ? 10
+        : viewSpanHz <= 120
+        ? 20
+        : 40;
+    const ticks: number[] = [];
+    const first = Math.ceil(viewMinHz / step) * step;
+    for (let f = first; f <= viewMaxHz + 1e-6; f += step) {
+      ticks.push(Math.round(f * 100) / 100);
+    }
+    return ticks;
+  }, [viewMinHz, viewMaxHz, viewSpanHz]);
 
-  const binStepHz =
-    spectrum && spectrum.frequenciesHz.length > 1
-      ? spectrum.frequenciesHz[1] - spectrum.frequenciesHz[0]
-      : 0.4;
+  const handleZoomHorizontal = (direction: 'in' | 'out') => {
+    const center =
+      selectedFreqHz !== null &&
+      selectedFreqHz >= viewMinHz &&
+      selectedFreqHz <= viewMaxHz
+        ? selectedFreqHz
+        : (viewMinHz + viewMaxHz) / 2;
+    const newSpan =
+      direction === 'in'
+        ? Math.max(10, viewSpanHz / 2)
+        : Math.min(200, viewSpanHz * 2);
+    let newMin = Math.max(0, center - newSpan / 2);
+    let newMax = newMin + newSpan;
+    if (newMax > 200) {
+      newMax = 200;
+      newMin = Math.max(0, 200 - newSpan);
+    }
+    setXRange({ min: Math.round(newMin), max: Math.round(newMax) });
+  };
 
-  const xTicks =
-    rangeHz === 30
-      ? [0, 5, 10, 15, 20, 25, 30]
-      : rangeHz === 60
-      ? [0, 10, 20, 30, 40, 50, 60]
-      : rangeHz === 100
-      ? [0, 20, 40, 60, 80, 100]
-      : [0, 40, 80, 120, 160, 200];
+  const handlePanHorizontal = (dir: -1 | 1) => {
+    const shift = Math.max(5, Math.round(viewSpanHz * 0.25)) * dir;
+    let newMin = viewMinHz + shift;
+    let newMax = viewMaxHz + shift;
+    if (newMin < 0) {
+      newMin = 0;
+      newMax = viewSpanHz;
+    }
+    if (newMax > 200) {
+      newMax = 200;
+      newMin = Math.max(0, 200 - viewSpanHz);
+    }
+    setXRange({ min: newMin, max: newMax });
+  };
 
-  const nyquistLimitedBelowSpan =
-    spectrum !== null && spectrum.nyquistHz > 5 && spectrum.nyquistHz < displayMaxHz - 0.5;
-
-  const bufferPct = bufferProgress
-    ? Math.min(100, Math.round((bufferProgress.collected / bufferProgress.target) * 100))
-    : 0;
+  const handleHoldClick = () => {
+    if (
+      isStreaming &&
+      bufferProgress &&
+      bufferProgress.collected < bufferProgress.target &&
+      !spectrum
+    ) {
+      setHeldIncompleteWarning(true);
+    }
+    onStopLiveStream();
+  };
 
   const handleCsvFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -333,69 +417,174 @@ export const DataCollectionScreen: React.FC<Props> = ({
     if (!file) return;
     try {
       const text = await file.text();
-      const parsed = parsePhyphoxCsv(text);
+      const parsed = parsePhyphoxCsv(text, selectedSingleAxis);
       if (!parsed) {
         setCsvError(
-          'Could not parse CSV. Export Phyphox Acceleration Spectrum as CSV ("Frequency (Hz)","Absolute Amplitude (a.u.)").'
+          'Could not parse CSV. Export Phyphox Acceleration Spectrum as CSV ("Frequency (Hz)","Absolute Amplitude").'
         );
         return;
       }
       setCsvError(null);
       setSelectedBinIdx(null);
-      setHasManualRange(false);
+      setOutOfRangeClickMsg(null);
       onImportSpectrum(parsed);
     } catch {
       setCsvError('Failed to read the selected CSV file.');
     }
   };
 
-  const handleLoadAttachedSampleCsv = async () => {
-    try {
-      const res = await fetch('/assets/aistudio/FFT_Spectrum_9bcf5eb1.csv');
-      if (!res.ok) {
-        setCsvError('Use Import Phyphox CSV to load a CSV file from your device.');
-        return;
-      }
-      const text = await res.text();
-      const parsed = parsePhyphoxCsv(text);
-      if (parsed) {
-        setCsvError(null);
-        setSelectedBinIdx(null);
-        setHasManualRange(false);
-        onImportSpectrum(parsed);
-      }
-    } catch {
-      setCsvError('Use Import Phyphox CSV to load a CSV file from your device.');
+  const singleAxisChoices: { id: SingleAxis; label: string }[] = [
+    { id: 'x', label: 'X' },
+    { id: 'y', label: 'Y' },
+    { id: 'z', label: 'Z' },
+  ];
+
+  const activeAxisLabel = selectedSingleAxis.toUpperCase();
+  const binStepHz = spectrum ? spectrum.resolutionHz : 0;
+
+  const bufferIncomplete =
+    (isStreaming && bufferProgress !== null && bufferProgress.collected < bufferProgress.target) ||
+    heldIncompleteWarning;
+  const bufferPct = bufferProgress
+    ? Math.min(100, Math.round((bufferProgress.collected / bufferProgress.target) * 100))
+    : 0;
+
+  const nyquistAboveView = spectrum ? spectrum.nyquistHz >= viewMaxHz - 0.1 : true;
+  const targetMonitorFreqHz = refFreqHz ?? referenceRunOFreqHz ?? selectedFreqHz;
+
+  // Build Acquisition Quality & Validation Warnings (Requirement 9)
+  const qualityWarnings = useMemo(() => {
+    const list: { severity: 'error' | 'warn' | 'info'; message: string }[] = [];
+
+    if (bufferIncomplete && bufferProgress) {
+      list.push({
+        severity: 'warn',
+        message: `Acquisition buffer incomplete (${bufferProgress.collected} / ${bufferProgress.target} samples). Allow sufficient acquisition time to fill all ${bufferProgress.target} samples before accepting a spectrum.`,
+      });
     }
-  };
+
+    if (bufferProgress && bufferProgress.irregularDuringFill && !spectrum) {
+      list.push({
+        severity: 'warn',
+        message: `Irregular sampling intervals detected during buffering (${bufferProgress.droppedDuringFill} dropped-sample gap(s)). Keep screen awake and close heavy background tabs.`,
+      });
+    }
+
+    if (spectrum) {
+      if (
+        targetMonitorFreqHz !== null &&
+        targetMonitorFreqHz > spectrum.nyquistHz - 0.2
+      ) {
+        list.push({
+          severity: 'error',
+          message: `Sampling rate too low for target frequency (${targetMonitorFreqHz.toFixed(
+            1
+          )} Hz): Actual rate is ${spectrum.sampleRateHz.toFixed(
+            1
+          )} Hz, giving a Nyquist limit of ${spectrum.nyquistHz.toFixed(
+            1
+          )} Hz. Frequencies above ${spectrum.nyquistHz.toFixed(1)} Hz cannot be measured on this browser.`,
+        });
+      } else if (spectrum.nyquistHz < 200) {
+        list.push({
+          severity: 'info',
+          message: `Usable spectrum ends at ${spectrum.nyquistHz.toFixed(
+            1
+          )} Hz (Actual sampling rate: ${spectrum.sampleRateHz.toFixed(
+            1
+          )} Hz). The shaded region from ${spectrum.nyquistHz.toFixed(
+            1
+          )} – 200 Hz exceeds Nyquist and is not measured.`,
+        });
+      }
+
+      if (spectrum.quality.hasIrregularSampling) {
+        list.push({
+          severity: 'warn',
+          message: `Irregular sampling intervals detected (jitter CV ${(
+            spectrum.quality.jitterCv * 100
+          ).toFixed(1)}%, est. ${
+            spectrum.quality.droppedSamplesEstimate
+          } dropped sample(s)). Frequency bins are computed from actual measured timestamps, but spectral sidelobes may elevate.`,
+        });
+      }
+
+      if (spectrum.quality.isNoisyOrUnstable) {
+        list.push({
+          severity: 'warn',
+          message: `Noisy or unstable vibration measurement (SNR ratio ${spectrum.quality.snrRatio.toFixed(
+            1
+          )}×, peak variation ${(spectrum.quality.peakStabilityCv * 100).toFixed(
+            0
+          )}%). Hold phone firmly against a rigid bearing housing at steady speed.`,
+        });
+      }
+    }
+
+    if (outOfRangeClickMsg) {
+      list.push({ severity: 'error', message: outOfRangeClickMsg });
+    }
+
+    if (isPeakOutsideValidRange && selectedFreqHz !== null && spectrum) {
+      list.push({
+        severity: 'error',
+        message: `Selected frequency (${selectedFreqHz.toFixed(
+          2
+        )} Hz) is outside the valid ${MIN_VALID_SPECTRUM_HZ.toFixed(
+          1
+        )} – ${spectrum.nyquistHz.toFixed(2)} Hz measurable range.`,
+      });
+    }
+
+    for (const cw of consistencyWarnings) {
+      list.push({ severity: 'error', message: cw });
+    }
+
+    return list;
+  }, [
+    bufferIncomplete,
+    bufferProgress,
+    spectrum,
+    targetMonitorFreqHz,
+    outOfRangeClickMsg,
+    isPeakOutsideValidRange,
+    selectedFreqHz,
+    consistencyWarnings,
+  ]);
 
   return (
     <div className="max-w-4xl mx-auto space-y-4 py-1">
-      {/* Run Title & Axis / Phase Bar */}
+      {/* Run Title & Single-Axis + Phase Bar */}
       <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-4 sm:p-5 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-xs font-mono text-slate-500">
-              Run {runIndex + 1} of 4 · Axis {activeAxisLabel}
-              {run.isKept ? ' · Saved' : ''}
+              Run {runIndex + 1} of 4 · Single-Axis Channel:{' '}
+              <strong className="text-slate-900">{activeAxisLabel}</strong>
+              {run.isKept ? ' · Confirmed' : ''}
+              {referenceRunOFreqHz !== null && run.type !== 'O'
+                ? ` · Run O 1X: ${referenceRunOFreqHz.toFixed(2)} Hz`
+                : ''}
             </p>
-            <h1 className="text-lg sm:text-xl font-bold text-slate-900 mt-0.5">{run.title}</h1>
+            <h1 className="text-lg sm:text-xl font-bold text-slate-900 mt-0.5">
+              {run.title}
+            </h1>
             <p className="text-xs text-slate-600 mt-0.5">{run.subtitle}</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            {/* Axis Selector */}
+            {/* Strict Single-Axis Selector (X, Y, or Z only) */}
             <div className="flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-xl p-1 text-xs">
-              <span className="text-slate-500 font-medium px-2">Axis:</span>
-              {axisChoices.map((ax) => {
-                const active = config.sensorAxis === ax.id;
+              <span className="text-slate-600 font-medium px-2">Axis:</span>
+              {singleAxisChoices.map((ax) => {
+                const active = selectedSingleAxis === ax.id;
                 return (
                   <button
                     key={ax.id}
                     type="button"
                     disabled={isAxisLocked || isStreaming}
                     onClick={() => onUpdateAxis(ax.id)}
-                    className={`min-w-[34px] min-h-[34px] px-2 rounded-lg font-mono font-bold transition-colors ${
+                    className={`min-w-[34px] min-h-[34px] px-2.5 rounded-lg font-mono font-bold transition-colors ${
                       active
                         ? 'bg-slate-900 text-white'
                         : isAxisLocked || isStreaming
@@ -408,7 +597,10 @@ export const DataCollectionScreen: React.FC<Props> = ({
                 );
               })}
               {isAxisLocked && (
-                <Lock className="w-3.5 h-3.5 text-amber-600 mr-1.5" aria-label="Axis locked across runs" />
+                <Lock
+                  className="w-3.5 h-3.5 text-amber-600 mr-1.5"
+                  aria-label="Axis locked consistently across O, T1, T2, and T3"
+                />
               )}
             </div>
 
@@ -431,9 +623,9 @@ export const DataCollectionScreen: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* Phyphox-Style 1024-Sample Spectrum Card */}
+      {/* Phyphox-Methodology Single-Axis Spectrum Card */}
       <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-4 sm:p-5 space-y-4">
-        {/* Top Action Controls */}
+        {/* Top Action Controls: Start, Hold, Clear, Samples, Peak Pick, CSV */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <button
@@ -447,12 +639,12 @@ export const DataCollectionScreen: React.FC<Props> = ({
               }`}
             >
               <Play className="w-4 h-4 fill-current" />
-              <span>Start Spectrum</span>
+              <span>{isStreaming ? 'Acquiring' : 'Start'}</span>
             </button>
 
             <button
               type="button"
-              onClick={onStopLiveStream}
+              onClick={handleHoldClick}
               disabled={!isStreaming}
               className={`min-h-[44px] px-4 py-2.5 rounded-xl font-bold text-xs flex items-center gap-2 transition-transform ${
                 isStreaming
@@ -460,23 +652,41 @@ export const DataCollectionScreen: React.FC<Props> = ({
                   : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
               }`}
             >
-              <Square className="w-3.5 h-3.5 fill-current" />
-              <span>Stop &amp; Freeze</span>
+              <Pause className="w-3.5 h-3.5 fill-current" />
+              <span>Hold</span>
             </button>
 
             <button
               type="button"
               onClick={() => {
                 setSelectedBinIdx(null);
+                setOutOfRangeClickMsg(null);
+                setHeldIncompleteWarning(false);
                 setCsvError(null);
                 onClearSpectrum();
               }}
-              disabled={!spectrum && !bufferProgress}
+              disabled={!spectrum && !bufferProgress && !isStreaming}
               className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 text-slate-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
-              title="Clear captured spectrum"
+              title="Clear captured samples and spectrum"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>Clear</span>
+            </button>
+
+            {/* Explicit PEAK PICK Control */}
+            <button
+              type="button"
+              onClick={() => setPeakPickActive((v) => !v)}
+              aria-pressed={peakPickActive}
+              className={`min-h-[44px] px-3.5 py-2 rounded-xl font-bold text-xs flex items-center gap-1.5 border transition-colors cursor-pointer ${
+                peakPickActive
+                  ? 'bg-amber-600 hover:bg-amber-700 border-amber-700 text-white shadow-xs'
+                  : 'bg-white hover:bg-slate-50 border-slate-300 text-slate-700'
+              }`}
+              title="Toggle manual Peak Pick cursor mode on spectrum"
+            >
+              <Crosshair className="w-4 h-4" />
+              <span>PEAK PICK: {peakPickActive ? 'ON' : 'OFF'}</span>
             </button>
 
             <input
@@ -489,115 +699,219 @@ export const DataCollectionScreen: React.FC<Props> = ({
             <button
               type="button"
               onClick={() => csvInputRef.current?.click()}
-              className="min-h-[44px] px-3.5 py-2 rounded-xl border border-cyan-600/40 bg-cyan-50 hover:bg-cyan-100 text-cyan-900 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors"
-              title="Import full 0–200 Hz (412 Hz) Acceleration Spectrum CSV exported from Phyphox"
+              className="min-h-[44px] px-3 py-2 rounded-xl border border-cyan-600/40 bg-cyan-50 hover:bg-cyan-100 text-cyan-900 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors"
+              title="Import Acceleration Spectrum CSV exported from Phyphox"
             >
               <Upload className="w-3.5 h-3.5" />
-              <span>Import Phyphox CSV</span>
+              <span>Import CSV</span>
             </button>
-
-            {/* Range Toggle: 30 Hz, 60 Hz, 100 Hz, 200 Hz */}
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl text-xs">
-              {([30, 60, 100, 200] as const).map((hz) => (
-                <button
-                  key={hz}
-                  type="button"
-                  onClick={() => {
-                    setHasManualRange(true);
-                    setRangeHz(hz);
-                  }}
-                  className={`px-2.5 py-1.5 rounded-lg font-mono text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                    rangeHz === hz
-                      ? 'bg-white text-slate-900 font-bold shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {hz} Hz
-                </button>
-              ))}
-            </div>
           </div>
 
-          {/* Optional Reference RPM Input */}
-          <div className="flex items-center gap-2 text-xs">
-            <label htmlFor="ref-rpm-input" className="text-slate-600 font-medium whitespace-nowrap">
-              Ref RPM (opt):
-            </label>
-            <input
-              id="ref-rpm-input"
-              type="text"
-              inputMode="numeric"
-              placeholder="e.g. 2580"
-              value={optionalRpm}
-              onChange={(e) => setOptionalRpm(e.target.value.replace(/[^0-9]/g, ''))}
-              className="w-24 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1.5 text-right font-mono font-semibold text-slate-900 text-xs focus:bg-white focus:outline-none focus:border-cyan-600"
-            />
-            {refFreqHz !== null && (
-              <span className="font-mono text-[11px] text-violet-700 font-semibold whitespace-nowrap">
-                {refFreqHz.toFixed(1)} Hz
-              </span>
-            )}
+          {/* Configurable FFT Sample Count + Optional Ref RPM */}
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <div className="flex items-center gap-1.5">
+              <label
+                htmlFor="fft-samples-select"
+                className="text-slate-600 font-medium whitespace-nowrap"
+              >
+                FFT Samples:
+              </label>
+              <select
+                id="fft-samples-select"
+                value={fftSampleCount}
+                disabled={isStreaming}
+                onChange={(e) =>
+                  onChangeFftSampleCount(Number(e.target.value) as FftSampleCount)
+                }
+                className="bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1.5 font-mono font-bold text-slate-900 text-xs focus:bg-white focus:outline-none focus:border-cyan-600 disabled:opacity-60"
+              >
+                {FFT_SAMPLE_OPTIONS.map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt} {opt === 1024 ? '(Default)' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <label
+                htmlFor="ref-rpm-input"
+                className="text-slate-600 font-medium whitespace-nowrap"
+              >
+                Ref RPM:
+              </label>
+              <input
+                id="ref-rpm-input"
+                type="text"
+                inputMode="numeric"
+                placeholder="opt"
+                value={optionalRpm}
+                onChange={(e) => setOptionalRpm(e.target.value.replace(/[^0-9]/g, ''))}
+                className="w-20 bg-slate-50 border border-slate-300 rounded-lg px-2 py-1.5 text-right font-mono font-semibold text-slate-900 text-xs focus:bg-white focus:outline-none focus:border-cyan-600"
+              />
+              {refFreqHz !== null && (
+                <span className="font-mono text-[11px] text-violet-700 font-semibold whitespace-nowrap">
+                  {refFreqHz.toFixed(1)} Hz
+                </span>
+              )}
+            </div>
           </div>
         </div>
 
-        {/* Measurement Parameters Strip */}
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono tabular-nums text-slate-600 border-b border-slate-200 pb-2.5">
-          {spectrum ? (
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-              <span>
-                Samples: <strong className="text-slate-900">{spectrum.samplesUsed}</strong>
-                {spectrum.fftSize > spectrum.samplesUsed && (
-                  <span className="text-slate-400"> ({spectrum.fftSize}-pt FFT)</span>
-                )}
-              </span>
-              <span>
-                Period: <strong className="text-slate-900">{spectrum.periodSec.toFixed(2)} s</strong>
-              </span>
-              <span>
-                Resolution: <strong className="text-slate-900">{spectrum.resolutionHz.toFixed(2)} Hz</strong>
-              </span>
-              <span>
-                Rate: <strong className="text-slate-900">{Math.round(spectrum.sampleRateHz)} Hz</strong>
-              </span>
-              <span>
-                Nyquist: <strong className="text-slate-900">{Math.round(spectrum.nyquistHz)} Hz</strong>
-              </span>
-              <span className="text-slate-400">({spectrum.sensorSource})</span>
-            </div>
-          ) : (
-            <span>
-              {isStreaming && bufferProgress
-                ? `Buffering FFT window: ${bufferProgress.collected} / ${bufferProgress.target}${
-                    bufferProgress.estimatedRateHz
-                      ? ` · ${Math.round(bufferProgress.estimatedRateHz)} Hz`
-                      : ''
-                  }`
-                : isSimulatorMode
-                ? 'Simulator ready (411 Hz · 1024 samples · 0.40 Hz res) · Press Start Spectrum'
-                : 'Press Start Spectrum (~2 s to first display), hold phone steady on bearing, then Stop & Freeze'}
-            </span>
-          )}
+        {/* Zoom & Vertical Scaling Controls (never alters underlying FFT data) */}
+        <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-slate-500 font-medium mr-1">Freq View:</span>
+            <button
+              type="button"
+              onClick={() => setXRange({ min: 0, max: 200 })}
+              className={`px-2 py-1 rounded-md font-mono font-semibold cursor-pointer ${
+                viewMinHz === 0 && viewMaxHz === 200
+                  ? 'bg-slate-900 text-white'
+                  : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
+              }`}
+            >
+              0–200 Hz
+            </button>
+            {spectrum && spectrum.nyquistHz < 195 && (
+              <button
+                type="button"
+                onClick={() =>
+                  setXRange({
+                    min: 0,
+                    max: Math.max(10, Math.ceil(spectrum.nyquistHz)),
+                  })
+                }
+                className={`px-2 py-1 rounded-md font-mono font-semibold cursor-pointer ${
+                  viewMinHz === 0 &&
+                  Math.abs(viewMaxHz - Math.ceil(spectrum.nyquistHz)) <= 1
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                0–Nyquist ({Math.ceil(spectrum.nyquistHz)} Hz)
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => handleZoomHorizontal('in')}
+              disabled={viewSpanHz <= 10}
+              className="px-2 py-1 rounded-md bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:opacity-40 flex items-center gap-1 cursor-pointer"
+              title="Zoom in horizontally"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => handleZoomHorizontal('out')}
+              disabled={viewSpanHz >= 200}
+              className="px-2 py-1 rounded-md bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:opacity-40 flex items-center gap-1 cursor-pointer"
+              title="Zoom out horizontally"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+            {viewSpanHz < 200 && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => handlePanHorizontal(-1)}
+                  disabled={viewMinHz <= 0}
+                  className="px-1.5 py-1 rounded-md bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:opacity-40 cursor-pointer"
+                  title="Pan left"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePanHorizontal(1)}
+                  disabled={viewMaxHz >= 200}
+                  className="px-1.5 py-1 rounded-md bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:opacity-40 cursor-pointer"
+                  title="Pan right"
+                >
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-500 font-medium">Y Scale:</span>
+            {([1, 2, 4, 8] as const).map((z) => (
+              <button
+                key={z}
+                type="button"
+                onClick={() => setYZoom(z)}
+                className={`px-2 py-1 rounded-md font-mono font-semibold cursor-pointer ${
+                  yZoom === z
+                    ? 'bg-cyan-700 text-white'
+                    : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                {z === 1 ? 'Auto' : `${z}×`}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Status Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-slate-600">
+          <span>
+            {isStreaming
+              ? spectrum
+                ? `Rolling ${spectrum.samplesUsed}-sample single-axis (${activeAxisLabel}) FFT active`
+                : `Filling ${fftSampleCount}-sample ${activeAxisLabel}-axis FFT buffer...`
+              : spectrum
+              ? `Frozen ${spectrum.samplesUsed}-sample spectrum (${activeAxisLabel}-axis)`
+              : isSimulatorMode
+              ? `Simulator enabled (411 Hz, ${fftSampleCount} samples, ${activeAxisLabel}-axis)`
+              : `Ready: ${activeAxisLabel}-axis · ${fftSampleCount} samples · Requested view 0–200 Hz`}
+          </span>
           <span className="text-cyan-700 font-sans font-semibold">
             {isStreaming
               ? spectrum
-                ? `● Live ${spectrum.fftSize}-pt FFT`
-                : '● Collecting Window...'
+                ? `● Live Frame #${spectrum.frameCount}`
+                : '● Acquiring Buffer...'
               : spectrum
-              ? 'Spectrum Frozen'
-              : ''}
+              ? 'Held (Ready for Peak Pick)'
+              : 'Idle'}
           </span>
         </div>
 
+        {/* Error & Acquisition Quality Warnings */}
         {(streamError || csvError) && (
-          <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 flex items-start gap-2.5 text-xs text-rose-900">
+          <div className="bg-rose-50 border border-rose-300 rounded-xl p-3 flex items-start gap-2.5 text-xs text-rose-900">
             <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
             <span>{streamError || csvError}</span>
           </div>
         )}
 
+        {qualityWarnings.map((w, idx) => (
+          <div
+            key={`qw-${idx}`}
+            className={`rounded-xl px-3.5 py-2.5 flex items-start gap-2.5 text-xs leading-relaxed border ${
+              w.severity === 'error'
+                ? 'bg-rose-50 border-rose-300 text-rose-900'
+                : w.severity === 'warn'
+                ? 'bg-amber-50 border-amber-300 text-amber-900'
+                : 'bg-slate-100 border-slate-300 text-slate-800'
+            }`}
+          >
+            <AlertTriangle
+              className={`w-4 h-4 shrink-0 mt-0.5 ${
+                w.severity === 'error'
+                  ? 'text-rose-600'
+                  : w.severity === 'warn'
+                  ? 'text-amber-700'
+                  : 'text-slate-600'
+              }`}
+            />
+            <span>{w.message}</span>
+          </div>
+        ))}
+
         {/* Spectrum SVG Display */}
         <div className="w-full bg-white border border-slate-300 rounded-xl overflow-hidden">
-          {!spectrum || visibleIndices.length < 2 ? (
+          {!spectrum ? (
             <div className="h-72 sm:h-80 flex flex-col items-center justify-center p-6 text-center space-y-3 text-slate-500">
               <Activity
                 className={`w-9 h-9 stroke-[1.5] ${
@@ -606,84 +920,150 @@ export const DataCollectionScreen: React.FC<Props> = ({
               />
               <p className="text-sm font-semibold text-slate-700">
                 {isStreaming
-                  ? 'Collecting Initial FFT Window...'
-                  : `Acceleration Spectrum (0 – ${displayMaxHz} Hz)`}
+                  ? `Collecting ${fftSampleCount} Samples (${activeAxisLabel}-Axis)...`
+                  : `Single-Axis Acceleration Spectrum (0 – 200 Hz · ${activeAxisLabel}-Axis)`}
               </p>
 
-              {isStreaming && bufferProgress && (
-                <div className="w-full max-w-xs space-y-1.5">
-                  <div className="h-2 w-full bg-slate-200 rounded-full overflow-hidden">
+              {(isStreaming || heldIncompleteWarning) && bufferProgress && (
+                <div className="w-full max-w-sm space-y-1.5">
+                  <div className="h-2.5 w-full bg-slate-200 rounded-full overflow-hidden">
                     <div
                       className="h-full bg-cyan-600 transition-all duration-150"
                       style={{ width: `${bufferPct}%` }}
                     />
                   </div>
-                  <p className="text-[11px] font-mono text-slate-600">
+                  <p className="text-xs font-mono text-slate-700">
                     {bufferProgress.collected} / {bufferProgress.target} samples ({bufferPct}%)
                     {bufferProgress.estimatedRateHz
-                      ? ` · ~${((bufferProgress.target - bufferProgress.collected) / bufferProgress.estimatedRateHz).toFixed(1)} s remaining`
+                      ? ` · Measured Rate: ${bufferProgress.estimatedRateHz.toFixed(1)} Hz`
                       : ''}
                   </p>
+                  {bufferProgress.estimatedRateHz && (
+                    <p className="text-[11px] font-mono text-slate-500">
+                      Elapsed: {bufferProgress.elapsedSec.toFixed(1)} s · Est. remaining:{' '}
+                      {Math.max(
+                        0,
+                        (bufferProgress.target - bufferProgress.collected) /
+                          bufferProgress.estimatedRateHz
+                      ).toFixed(1)}{' '}
+                      s (Nyquist ≈ {(bufferProgress.estimatedRateHz / 2).toFixed(1)} Hz)
+                    </p>
+                  )}
                 </div>
               )}
 
-              {!isStreaming && (
-                <div className="space-y-2.5 max-w-md">
-                  <p className="text-xs text-slate-500">
-                    Hold your phone steady against the bearing housing and tap <strong>Start Spectrum</strong> (~2 s, browser 30 Hz limit), OR tap <strong>Import Phyphox CSV</strong> to view a full 0–200 Hz (412 Hz rate) Phyphox scan directly.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={handleLoadAttachedSampleCsv}
-                    className="text-[11px] font-semibold text-cyan-700 hover:text-cyan-800 hover:underline cursor-pointer"
-                  >
-                    Preview Attached Phyphox 41.9 Hz (412 Hz) CSV
-                  </button>
-                </div>
+              {!isStreaming && !heldIncompleteWarning && (
+                <p className="text-xs text-slate-500 max-w-md">
+                  Hold the smartphone firmly against the bearing housing aligned with the{' '}
+                  <strong>{activeAxisLabel}-axis</strong>, press <strong>Start</strong> and allow{' '}
+                  <strong>{fftSampleCount} samples</strong> to fill for a valid FFT spectrum, then
+                  press <strong>Hold</strong> and use <strong>PEAK PICK</strong>.
+                </p>
               )}
             </div>
           ) : (
             <svg
               viewBox={`0 0 ${svgWidth} ${svgHeight}`}
-              className="w-full h-auto cursor-crosshair select-none block touch-manipulation"
-              onClick={handleSvgTap}
+              className={`w-full h-auto select-none block touch-none ${
+                peakPickActive ? 'cursor-crosshair' : 'cursor-default'
+              }`}
+              onPointerDown={(e) => {
+                if (!peakPickActive) return;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                setIsDraggingCursor(true);
+                pickFrequencyFromPointerEvent(e);
+              }}
+              onPointerMove={(e) => {
+                if (!isDraggingCursor || !peakPickActive) return;
+                pickFrequencyFromPointerEvent(e);
+              }}
+              onPointerUp={(e) => {
+                if (isDraggingCursor) {
+                  setIsDraggingCursor(false);
+                  try {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  } catch {
+                    // ignore
+                  }
+                }
+              }}
+              onPointerCancel={() => setIsDraggingCursor(false)}
             >
               <defs>
                 <linearGradient id={`specGrad-${run.type}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#0284c7" stopOpacity="0.22" />
+                  <stop offset="0%" stopColor="#0284c7" stopOpacity="0.24" />
                   <stop offset="85%" stopColor="#0284c7" stopOpacity="0.03" />
                   <stop offset="100%" stopColor="#0284c7" stopOpacity="0" />
                 </linearGradient>
+                <pattern
+                  id={`nyqHatch-${run.type}`}
+                  width="8"
+                  height="8"
+                  patternTransform="rotate(45 0 0)"
+                  patternUnits="userSpaceOnUse"
+                >
+                  <rect width="8" height="8" fill="#f1f5f9" />
+                  <line x1="0" y1="0" x2="0" y2="8" stroke="#cbd5e1" strokeWidth="1.5" />
+                </pattern>
               </defs>
 
-              {/* Browser Nyquist Limit Marker if sensor rate stops inside current display span */}
-              {nyquistLimitedBelowSpan && (
+              {/* Shaded Unmeasurable Zone Above Actual Nyquist (NEVER extrapolate or plot above Nyquist) */}
+              {!nyquistAboveView && spectrum.nyquistHz < viewMaxHz && (
                 <g>
                   <rect
-                    x={getX(spectrum.nyquistHz)}
+                    x={getX(Math.max(viewMinHz, spectrum.nyquistHz))}
                     y={padTop}
-                    width={padLeft + plotWidth - getX(spectrum.nyquistHz)}
+                    width={Math.max(
+                      0,
+                      padLeft + plotWidth - getX(Math.max(viewMinHz, spectrum.nyquistHz))
+                    )}
                     height={plotHeight}
-                    fill="#f8fafc"
+                    fill={`url(#nyqHatch-${run.type})`}
                   />
-                  <line
-                    x1={getX(spectrum.nyquistHz)}
-                    y1={padTop}
-                    x2={getX(spectrum.nyquistHz)}
-                    y2={padTop + plotHeight}
-                    stroke="#94a3b8"
-                    strokeWidth="1.2"
-                    strokeDasharray="4 4"
-                  />
-                  <text
-                    x={Math.min(padLeft + plotWidth - 78, getX(spectrum.nyquistHz) + 6)}
-                    y={padTop + 14}
-                    fill="#64748b"
-                    fontSize="9.5"
-                    fontFamily="monospace"
-                  >
-                    Nyquist {Math.round(spectrum.nyquistHz)} Hz
-                  </text>
+                  {spectrum.nyquistHz >= viewMinHz && (
+                    <>
+                      <line
+                        x1={getX(spectrum.nyquistHz)}
+                        y1={padTop}
+                        x2={getX(spectrum.nyquistHz)}
+                        y2={padTop + plotHeight}
+                        stroke="#dc2626"
+                        strokeWidth="1.5"
+                        strokeDasharray="5 4"
+                      />
+                      <rect
+                        x={Math.min(padLeft + plotWidth - 154, getX(spectrum.nyquistHz) + 6)}
+                        y={padTop + 6}
+                        width="148"
+                        height="28"
+                        rx="4"
+                        fill="#ffffff"
+                        fillOpacity="0.92"
+                        stroke="#fca5a5"
+                      />
+                      <text
+                        x={Math.min(padLeft + plotWidth - 80, getX(spectrum.nyquistHz) + 80)}
+                        y={padTop + 18}
+                        textAnchor="middle"
+                        fill="#b91c1c"
+                        fontSize="9.5"
+                        fontWeight="bold"
+                        fontFamily="monospace"
+                      >
+                        Nyquist: {spectrum.nyquistHz.toFixed(1)} Hz
+                      </text>
+                      <text
+                        x={Math.min(padLeft + plotWidth - 80, getX(spectrum.nyquistHz) + 80)}
+                        y={padTop + 29}
+                        textAnchor="middle"
+                        fill="#64748b"
+                        fontSize="8.5"
+                        fontFamily="monospace"
+                      >
+                        Not measurable above
+                      </text>
+                    </>
+                  )}
                 </g>
               )}
 
@@ -698,18 +1078,18 @@ export const DataCollectionScreen: React.FC<Props> = ({
                       y1={yp}
                       x2={padLeft + plotWidth}
                       y2={yp}
-                      stroke="#f1f5f9"
+                      stroke="#e2e8f0"
                       strokeDasharray="3 3"
                     />
                     <text
                       x={padLeft - 8}
                       y={yp + 4}
                       textAnchor="end"
-                      fill="#64748b"
+                      fill="#475569"
                       fontSize="10.5"
                       fontFamily="monospace"
                     >
-                      {v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v.toFixed(2)}
+                      {v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3)}
                     </text>
                   </g>
                 );
@@ -719,16 +1099,16 @@ export const DataCollectionScreen: React.FC<Props> = ({
                 x={16}
                 y={padTop + plotHeight / 2}
                 textAnchor="middle"
-                fill="#475569"
+                fill="#334155"
                 fontSize="10.5"
                 fontWeight="bold"
                 fontFamily="monospace"
                 transform={`rotate(-90, 16, ${padTop + plotHeight / 2})`}
               >
-                FFT Mag (AU)
+                Accel (m/s²)
               </text>
 
-              {/* X Gridlines (0..60, 0..100, or 0..200 Hz) */}
+              {/* X Gridlines */}
               {xTicks.map((freq) => {
                 const xp = getX(freq);
                 return (
@@ -738,14 +1118,14 @@ export const DataCollectionScreen: React.FC<Props> = ({
                       y1={padTop}
                       x2={xp}
                       y2={padTop + plotHeight}
-                      stroke="#f1f5f9"
+                      stroke="#e2e8f0"
                       strokeDasharray="3 3"
                     />
                     <text
                       x={xp}
                       y={padTop + plotHeight + 17}
                       textAnchor="middle"
-                      fill="#475569"
+                      fill="#334155"
                       fontSize="10.5"
                       fontFamily="monospace"
                     >
@@ -759,7 +1139,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
                       fontSize="9"
                       fontFamily="monospace"
                     >
-                      {freq * 60}
+                      {Math.round(freq * 60)} RPM
                     </text>
                   </g>
                 );
@@ -772,12 +1152,12 @@ export const DataCollectionScreen: React.FC<Props> = ({
                 width={plotWidth}
                 height={plotHeight}
                 fill="none"
-                stroke="#cbd5e1"
-                strokeWidth="1"
+                stroke="#94a3b8"
+                strokeWidth="1.1"
               />
 
               {/* Optional Reference RPM Line */}
-              {refFreqHz !== null && refFreqHz > 0 && refFreqHz <= displayMaxHz && (
+              {refFreqHz !== null && refFreqHz >= viewMinHz && refFreqHz <= viewMaxHz && (
                 <g>
                   <line
                     x1={getX(refFreqHz)}
@@ -789,7 +1169,10 @@ export const DataCollectionScreen: React.FC<Props> = ({
                     strokeDasharray="5 4"
                   />
                   <text
-                    x={Math.min(padLeft + plotWidth - 36, Math.max(padLeft + 36, getX(refFreqHz)))}
+                    x={Math.min(
+                      padLeft + plotWidth - 36,
+                      Math.max(padLeft + 36, getX(refFreqHz))
+                    )}
                     y={padTop + 14}
                     textAnchor="middle"
                     fill="#6d28d9"
@@ -802,69 +1185,52 @@ export const DataCollectionScreen: React.FC<Props> = ({
                 </g>
               )}
 
-              {/* Subtle Single-Frame Live Preview while Streaming */}
-              {isStreaming && spectrum.liveAmplitudesAU.length === spectrum.frequenciesHz.length && (() => {
-                const livePts = visibleIndices.map(
-                  (idx) =>
-                    `${getX(spectrum.frequenciesHz[idx])},${getY(
-                      spectrum.liveAmplitudesAU[idx] ?? 0
-                    )}`
-                );
-                return (
-                  <path
-                    d={`M ${livePts.join(' L ')}`}
-                    fill="none"
-                    stroke="#94a3b8"
-                    strokeWidth="1"
-                    strokeDasharray="2 3"
-                  />
-                );
-              })()}
+              {/* Primary Valid Single-Axis FFT Curve (strictly 0 .. Nyquist) */}
+              {plottedIndices.length >= 2 &&
+                (() => {
+                  const pts = plottedIndices.map(
+                    (idx) =>
+                      `${getX(spectrum.frequenciesHz[idx])},${getY(
+                        spectrum.amplitudesMs2[idx] ?? 0
+                      )}`
+                  );
+                  const x0 = getX(spectrum.frequenciesHz[plottedIndices[0]]);
+                  const xLast = getX(
+                    spectrum.frequenciesHz[plottedIndices[plottedIndices.length - 1]]
+                  );
+                  const yBase = padTop + plotHeight;
+                  return (
+                    <>
+                      <path
+                        d={`M ${x0},${yBase} L ${pts.join(' L ')} L ${xLast},${yBase} Z`}
+                        fill={`url(#specGrad-${run.type})`}
+                      />
+                      <path
+                        d={`M ${pts.join(' L ')}`}
+                        fill="none"
+                        stroke="#0284c7"
+                        strokeWidth="2.1"
+                        strokeLinejoin="round"
+                      />
+                      {plottedIndices.length <= 120 &&
+                        plottedIndices.map((idx) => (
+                          <circle
+                            key={`pt-${idx}`}
+                            cx={getX(spectrum.frequenciesHz[idx])}
+                            cy={getY(spectrum.amplitudesMs2[idx] ?? 0)}
+                            r="2.1"
+                            fill="#0284c7"
+                          />
+                        ))}
+                    </>
+                  );
+                })()}
 
-              {/* Primary Sharp FFT Curve */}
-              {(() => {
-                const pts = visibleIndices.map(
-                  (idx) =>
-                    `${getX(spectrum.frequenciesHz[idx])},${getY(
-                      spectrum.amplitudesAU[idx] ?? 0
-                    )}`
-                );
-                const x0 = getX(spectrum.frequenciesHz[visibleIndices[0]]);
-                const xLast = getX(
-                  spectrum.frequenciesHz[visibleIndices[visibleIndices.length - 1]]
-                );
-                const yBase = padTop + plotHeight;
-                return (
-                  <>
-                    <path
-                      d={`M ${x0},${yBase} L ${pts.join(' L ')} L ${xLast},${yBase} Z`}
-                      fill={`url(#specGrad-${run.type})`}
-                    />
-                    <path
-                      d={`M ${pts.join(' L ')}`}
-                      fill="none"
-                      stroke="#0284c7"
-                      strokeWidth="2.1"
-                      strokeLinejoin="round"
-                    />
-                    {visibleIndices.length <= 80 &&
-                      visibleIndices.map((idx) => (
-                        <circle
-                          key={`pt-${idx}`}
-                          cx={getX(spectrum.frequenciesHz[idx])}
-                          cy={getY(spectrum.amplitudesAU[idx] ?? 0)}
-                          r="2.3"
-                          fill="#0284c7"
-                        />
-                      ))}
-                  </>
-                );
-              })()}
-
-              {/* User-Selected 1X Peak Cursor */}
+              {/* User-Controlled Peak Pick Vertical Cursor */}
               {selectedFreqHz !== null &&
-                selectedAmpAU !== null &&
-                selectedFreqHz <= displayMaxHz && (
+                selectedAmpMs2 !== null &&
+                selectedFreqHz >= viewMinHz &&
+                selectedFreqHz <= Math.min(viewMaxHz, spectrum.nyquistHz) && (
                   <g>
                     <line
                       x1={getX(selectedFreqHz)}
@@ -876,7 +1242,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
                     />
                     <circle
                       cx={getX(selectedFreqHz)}
-                      cy={getY(selectedAmpAU)}
+                      cy={getY(selectedAmpMs2)}
                       r="5.5"
                       fill="#d97706"
                       stroke="#ffffff"
@@ -884,28 +1250,28 @@ export const DataCollectionScreen: React.FC<Props> = ({
                     />
                     <rect
                       x={Math.min(
-                        padLeft + plotWidth - 102,
-                        Math.max(padLeft + 4, getX(selectedFreqHz) - 51)
+                        padLeft + plotWidth - 114,
+                        Math.max(padLeft + 4, getX(selectedFreqHz) - 57)
                       )}
                       y={padTop + 6}
-                      width="102"
-                      height="17"
+                      width="114"
+                      height="18"
                       rx="4"
                       fill="#d97706"
                     />
                     <text
                       x={Math.min(
-                        padLeft + plotWidth - 51,
-                        Math.max(padLeft + 55, getX(selectedFreqHz))
+                        padLeft + plotWidth - 57,
+                        Math.max(padLeft + 61, getX(selectedFreqHz))
                       )}
-                      y={padTop + 18}
+                      y={padTop + 18.5}
                       textAnchor="middle"
                       fill="#ffffff"
                       fontSize="10"
                       fontWeight="bold"
                       fontFamily="monospace"
                     >
-                      1X: {selectedFreqHz.toFixed(1)} Hz
+                      {selectedFreqHz.toFixed(2)} Hz
                     </text>
                   </g>
                 )}
@@ -913,27 +1279,117 @@ export const DataCollectionScreen: React.FC<Props> = ({
           )}
         </div>
 
-        {/* Browser Sample Rate Notice if Hardware Browser Rate < 120 Hz */}
-        {spectrum && spectrum.sampleRateHz < 120 && (
-          <div className="bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5 flex items-start gap-2.5 text-xs text-amber-900 leading-relaxed">
-            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-            <div>
-              <strong>Browser Sensor Limit ({Math.round(spectrum.sampleRateHz)} Hz · Nyquist {Math.round(spectrum.nyquistHz)} Hz):</strong>{' '}
-              Chrome &amp; Safari hard-cap all web pages at ~60 Hz (~30 Hz max unaliased frequency), so a 41.9 Hz rotor + harmonics cannot be measured live inside a web browser. Native apps like Phyphox hold Android&apos;s <code className="font-mono text-[11px] bg-amber-100/80 px-1 rounded">HIGH_SAMPLING_RATE_SENSORS</code> permission for ~412 Hz (206 Hz Nyquist).
-              To see and tap the exact 0–200 Hz spectrum here, export CSV from Phyphox and click <strong>Import Phyphox CSV</strong> above (or enter the 1X value in <strong>Manual Override</strong>).
+        {/* Fine Peak Cursor Slider when spectrum is present & Peak Pick ON */}
+        {spectrum && peakPickActive && maxValidBinIdx > 1 && (
+          <div className="bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 flex flex-col sm:flex-row sm:items-center gap-3">
+            <span className="text-[11px] font-bold text-slate-700 whitespace-nowrap">
+              Cursor Scrub (0–{spectrum.nyquistHz.toFixed(1)} Hz):
+            </span>
+            <input
+              type="range"
+              min={1}
+              max={maxValidBinIdx}
+              step={1}
+              value={selectedBinIdx ?? Math.min(maxValidBinIdx, Math.max(1, Math.round(maxValidBinIdx / 4)))}
+              onChange={(e) => {
+                setOutOfRangeClickMsg(null);
+                setSelectedBinIdx(Number(e.target.value));
+              }}
+              className="flex-1 accent-amber-600 cursor-pointer"
+              aria-label="Peak Pick Frequency Cursor"
+            />
+            <div className="flex items-center gap-1.5 text-[11px]">
+              <button
+                type="button"
+                onClick={() => setUseInterpolation(false)}
+                className={`px-2 py-1 rounded-md font-semibold cursor-pointer ${
+                  !useInterpolation
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-white border border-slate-300 text-slate-700'
+                }`}
+              >
+                Nearest Bin
+              </button>
+              <button
+                type="button"
+                onClick={() => setUseInterpolation(true)}
+                className={`px-2 py-1 rounded-md font-semibold cursor-pointer ${
+                  useInterpolation
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-white border border-slate-300 text-slate-700'
+                }`}
+              >
+                Interpolated
+              </button>
             </div>
           </div>
         )}
 
-        {/* Selected Peak Readout & Accept Button */}
+        {/* Required Acquisition Info Below the Spectrum (Requirement 5) */}
+        <div className="bg-slate-50 border border-slate-300 rounded-xl p-3.5">
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3 text-xs font-mono tabular-nums">
+            <div>
+              <span className="text-[10px] font-sans uppercase tracking-wider text-slate-500 block">
+                Actual Sample Rate
+              </span>
+              <strong className="text-slate-900 text-sm">
+                {spectrum ? `${spectrum.sampleRateHz.toFixed(1)} Hz` : '—'}
+              </strong>
+            </div>
+            <div>
+              <span className="text-[10px] font-sans uppercase tracking-wider text-slate-500 block">
+                Selected Axis
+              </span>
+              <strong className="text-slate-900 text-sm">{activeAxisLabel}</strong>
+            </div>
+            <div>
+              <span className="text-[10px] font-sans uppercase tracking-wider text-slate-500 block">
+                Samples Used
+              </span>
+              <strong className="text-slate-900 text-sm">
+                {spectrum ? spectrum.samplesUsed : fftSampleCount}
+              </strong>
+            </div>
+            <div>
+              <span className="text-[10px] font-sans uppercase tracking-wider text-slate-500 block">
+                Duration
+              </span>
+              <strong className="text-slate-900 text-sm">
+                {spectrum ? `${spectrum.periodSec.toFixed(2)} s` : '—'}
+              </strong>
+            </div>
+            <div>
+              <span className="text-[10px] font-sans uppercase tracking-wider text-slate-500 block">
+                Resolution (Δf)
+              </span>
+              <strong className="text-slate-900 text-sm">
+                {spectrum ? `${spectrum.resolutionHz.toFixed(4)} Hz` : '—'}
+              </strong>
+            </div>
+            <div>
+              <span className="text-[10px] font-sans uppercase tracking-wider text-slate-500 block">
+                Nyquist Freq
+              </span>
+              <strong className="text-slate-900 text-sm">
+                {spectrum ? `${spectrum.nyquistHz.toFixed(2)} Hz` : '—'}
+              </strong>
+            </div>
+          </div>
+        </div>
+
+        {/* User-Controlled Peak Pick Readout & Confirm Panel (Requirement 7) */}
         <div className="bg-slate-100 border border-slate-300 rounded-xl p-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
-              <Crosshair className="w-4 h-4 text-amber-600" />
+              <Crosshair className="w-4 h-4 text-amber-600 shrink-0" />
               <span>
-                {selectedFreqHz === null
-                  ? 'Tap the peak at the running speed frequency on the spectrum after removing the phone to select your 1X value'
-                  : `Selected 1X Peak @ ${selectedFreqHz.toFixed(2)} Hz (${Math.round(selectedFreqHz * 60)} RPM)`}
+                {!peakPickActive
+                  ? 'Activate PEAK PICK above to move the cursor onto your running-speed peak'
+                  : selectedFreqHz === null
+                  ? 'Tap or drag across the spectrum (or use the cursor slider) to select your 1X running-speed peak'
+                  : `Peak Pick Cursor Active${
+                      peakPickReadout?.isInterpolated ? ' (3-Bin Parabolic Interpolation)' : ''
+                    }`}
               </span>
             </div>
 
@@ -945,63 +1401,82 @@ export const DataCollectionScreen: React.FC<Props> = ({
                   className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-xs font-mono font-bold text-slate-700 flex items-center cursor-pointer"
                 >
                   <ChevronLeft className="w-3.5 h-3.5" />
-                  <span>{binStepHz.toFixed(2)}Hz</span>
+                  <span>-{binStepHz.toFixed(3)} Hz</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => handleStepBin(1)}
                   className="px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-xs font-mono font-bold text-slate-700 flex items-center cursor-pointer"
                 >
-                  <span>{binStepHz.toFixed(2)}Hz</span>
+                  <span>+{binStepHz.toFixed(3)} Hz</span>
                   <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
             )}
           </div>
 
-          {selectedFreqHz !== null && selectedAmpAU !== null && (
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-1">
-              <div className="flex items-baseline gap-6">
+          {selectedFreqHz !== null && selectedAmpMs2 !== null && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-1 border-t border-slate-200">
+              <div className="flex flex-wrap items-baseline gap-6">
                 <div>
-                  <span className="text-[11px] text-slate-500 block">Selected Frequency</span>
+                  <span className="text-[11px] text-slate-600 font-semibold block">
+                    Selected Frequency:
+                  </span>
                   <span className="text-xl font-bold font-mono tabular-nums text-slate-900">
                     {selectedFreqHz.toFixed(2)} Hz
+                  </span>
+                  <span className="text-xs font-mono text-slate-500 ml-2">
+                    ({Math.round(selectedFreqHz * 60)} RPM)
                   </span>
                 </div>
                 <div>
                   <span className="text-[11px] text-cyan-800 font-semibold block">
-                    1X Amplitude
+                    Selected Acceleration:
                   </span>
                   <span className="text-2xl font-extrabold font-mono tabular-nums text-cyan-800">
-                    {selectedAmpAU.toFixed(3)}
+                    {selectedAmpMs2.toFixed(3)}
                   </span>
-                  <span className="text-xs font-mono text-cyan-700 ml-1">AU</span>
+                  <span className="text-xs font-mono text-cyan-700 ml-1">m/s²</span>
                 </div>
               </div>
 
               <button
                 type="button"
-                onClick={() => onKeepMeasurement(selectedAmpAU, selectedFreqHz)}
-                disabled={selectedAmpAU <= 0}
-                className="min-h-[44px] px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-200 text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-[0.98] transition-all shrink-0"
+                onClick={() =>
+                  onKeepMeasurement(selectedAmpMs2, selectedFreqHz, {
+                    sampleRateHz: spectrum?.sampleRateHz,
+                    samplesUsed: spectrum?.samplesUsed,
+                    axisUsed: spectrum?.axisUsed ?? selectedSingleAxis,
+                  })
+                }
+                disabled={selectedAmpMs2 <= 0 || isPeakOutsideValidRange}
+                className="min-h-[44px] px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-[0.98] transition-all shrink-0"
               >
                 <CheckCircle2 className="w-4 h-4" />
-                <span>Accept 1X ({selectedAmpAU.toFixed(3)} AU)</span>
+                <span>Confirm Selected Peak ({selectedAmpMs2.toFixed(3)} m/s²)</span>
               </button>
             </div>
           )}
         </div>
       </div>
 
-      {/* Saved / Manual Override Row */}
+      {/* Saved / Manual Entry Row */}
       <div className="bg-white border border-slate-300 shadow-sm rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="space-y-0.5">
           <span className="text-xs font-bold text-slate-800 block">
-            Accepted Run Value / Manual Override (AU)
+            Confirmed Run Value / Manual Entry (m/s² or consistent units)
           </span>
           <span className="text-[11px] text-slate-500 block">
-            Use the spectrum value above or type a reading directly (e.g. from Phyphox or a meter). Measurements can be repeated to establish consistency
+            Populated when you confirm a Peak Pick selection above, or enter a value directly. Keep units &amp; sensor axis identical across all 4 runs.
           </span>
+          {run.isKept && run.frequencyHz > 0 && (
+            <span className="text-[11px] font-mono text-emerald-700 font-semibold block pt-0.5">
+              Stored 1X: {run.amplitudeMils} @ {run.frequencyHz.toFixed(2)} Hz (
+              {run.runningRpm} RPM)
+              {run.axisUsed ? ` · Axis ${run.axisUsed.toUpperCase()}` : ''}
+              {run.fftSampleCountUsed ? ` · N=${run.fftSampleCountUsed}` : ''}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2 sm:w-56">
@@ -1015,7 +1490,7 @@ export const DataCollectionScreen: React.FC<Props> = ({
             className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-right font-mono tabular-nums text-base font-bold text-slate-900 focus:bg-white focus:outline-none focus:border-cyan-600"
           />
           <span className="text-xs font-mono font-semibold text-slate-600 whitespace-nowrap">
-            AU
+            m/s²
           </span>
         </div>
       </div>

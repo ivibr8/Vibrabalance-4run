@@ -1,14 +1,22 @@
 import {
+  AcquisitionQuality,
   BufferProgress,
+  FftSampleCount,
   LiveSpectrumFrame,
   SensorAxis,
+  SingleAxis,
   SpectrumMeasurement,
   VibrationSample,
 } from '../types/balancing';
 
-export const PHYPHOX_FFT_SAMPLES = 1024;
-export const BROWSER_MIN_WINDOW_SAMPLES = 128; // ~2.1s at 60 Hz for fast startup
-export const MIN_SPECTRUM_HZ = 1.0;
+export const FFT_SAMPLE_OPTIONS: FftSampleCount[] = [256, 512, 1024, 2048, 4096];
+export const DEFAULT_FFT_SAMPLE_COUNT: FftSampleCount = 1024;
+export const MIN_VALID_SPECTRUM_HZ = 0.5;
+
+export function normalizeSingleAxis(axis: SensorAxis): SingleAxis {
+  if (axis === 'x' || axis === 'y' || axis === 'z') return axis;
+  return 'z';
+}
 
 /**
  * In-place Radix-2 Cooley-Tukey FFT. Length N must be a power of 2.
@@ -62,211 +70,283 @@ export function fftRadix2(real: Float64Array, imag: Float64Array): void {
 }
 
 /**
- * Picks the largest power-of-2 real sample count (128..1024) suited for the
- * sensor's actual sample rate so the user never waits 17+ seconds on a 60 Hz browser,
- * while native-rate sensors (~400+ Hz) still use full 1024 real samples (~2.5 s).
+ * Single-axis DC removal, Hann windowing, and exact N-point one-sided amplitude normalization (m/s^2).
  */
-function pickRealWindowSize(availableCount: number, estRateHz: number | null): number {
-  const maxForRate =
-    estRateHz === null || estRateHz >= 280
-      ? 1024
-      : estRateHz >= 140
-      ? 512
-      : 256;
-
-  if (availableCount >= 1024 && maxForRate >= 1024) return 1024;
-  if (availableCount >= 512 && maxForRate >= 512) return 512;
-  if (availableCount >= 256 && maxForRate >= 256) return 256;
-  if (availableCount >= 128) return 128;
-  return 0;
-}
-
-/**
- * Computes single-sided Hann-windowed FFT magnitudes (Arbitrary Units) for `nReal`
- * samples zero-padded to `fftSize` (1024). Subtracts mean first to remove static gravity.
- * Normalizes strictly by `windowSum` of the Hann window so amplitudes stay calibrated
- * across 128, 256, 512, and 1024 real-sample windows with minimal scalloping loss.
- */
-function computeSingleAxisMagnitudes(
+function computeSingleAxisOneSidedSpectrum(
   values: Float64Array,
-  nReal: number,
   fftSize: number
 ): Float64Array {
+  // 1. Remove mean / static DC & gravitational offset
   let mean = 0;
-  for (let i = 0; i < nReal; i++) {
+  for (let i = 0; i < fftSize; i++) {
     mean += values[i];
   }
-  mean /= nReal;
+  mean /= fftSize;
 
+  // 2. Apply Hann window
   const real = new Float64Array(fftSize);
   const imag = new Float64Array(fftSize);
-
   let windowSum = 0;
-  for (let i = 0; i < nReal; i++) {
-    const w = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (nReal - 1)));
+  const denom = fftSize > 1 ? fftSize - 1 : 1;
+  for (let i = 0; i < fftSize; i++) {
+    const w = 0.5 * (1 - Math.cos((2 * Math.PI * i) / denom));
     windowSum += w;
     real[i] = (values[i] - mean) * w;
   }
 
+  // 3. Complex FFT
   fftRadix2(real, imag);
 
+  // 4. Magnitude & one-sided normalization in m/s^2
   const halfN = fftSize / 2;
   const numBins = halfN + 1;
   const mags = new Float64Array(numBins);
-  const scaleSingle = windowSum > 0 ? 2.0 / windowSum : 2.0 / nReal;
-  const scaleNyq = windowSum > 0 ? 1.0 / windowSum : 1.0 / nReal;
+  const scaleSingle = windowSum > 0 ? 2.0 / windowSum : 2.0 / fftSize;
+  const scaleNyq = windowSum > 0 ? 1.0 / windowSum : 1.0 / fftSize;
 
+  mags[0] = 0;
   for (let k = 1; k < numBins; k++) {
     const s = k === halfN ? scaleNyq : scaleSingle;
     mags[k] = Math.hypot(real[k], imag[k]) * s;
   }
-  mags[0] = 0;
 
   return mags;
 }
 
-function estimateSampleRateHz(samples: VibrationSample[]): number | null {
-  if (samples.length < 12) return null;
-  const spanSec = (samples[samples.length - 1].timestamp - samples[0].timestamp) / 1000;
-  if (spanSec <= 0.05) return null;
-  const rate = (samples.length - 1) / spanSec;
-  return Number.isFinite(rate) && rate >= 10 ? rate : null;
+/**
+ * Analyzes consecutive high-resolution sample timestamps for actual rate, jitter, and dropped samples.
+ */
+export function analyzeTimestampIntervals(samples: VibrationSample[]): {
+  actualSampleRateHz: number;
+  spanSec: number;
+  medianDtMs: number;
+  meanDtMs: number;
+  minDtMs: number;
+  maxDtMs: number;
+  jitterCv: number;
+  droppedSamplesEstimate: number;
+  irregularIntervalFraction: number;
+  hasIrregularSampling: boolean;
+} | null {
+  const n = samples.length;
+  if (n < 8) return null;
+
+  const spanMs = samples[n - 1].timestamp - samples[0].timestamp;
+  if (spanMs <= 20) return null;
+
+  const dts: number[] = new Array(n - 1);
+  let minDtMs = Infinity;
+  let maxDtMs = 0;
+
+  for (let i = 1; i < n; i++) {
+    const dt = samples[i].timestamp - samples[i - 1].timestamp;
+    dts[i - 1] = dt;
+    if (dt < minDtMs) minDtMs = dt;
+    if (dt > maxDtMs) maxDtMs = dt;
+  }
+
+  const sorted = [...dts].sort((a, b) => a - b);
+  const medianDtMs = sorted[Math.floor(sorted.length / 2)];
+  const meanDtMs = spanMs / (n - 1);
+  const actualSampleRateHz = 1000 / meanDtMs;
+
+  if (!Number.isFinite(actualSampleRateHz) || actualSampleRateHz < 5) {
+    return null;
+  }
+
+  let sqDiffSum = 0;
+  let irregularCount = 0;
+  let droppedSamplesEstimate = 0;
+  const safeMedian = Math.max(0.1, medianDtMs);
+
+  for (let i = 0; i < dts.length; i++) {
+    const dt = dts[i];
+    const diff = dt - meanDtMs;
+    sqDiffSum += diff * diff;
+    if (Math.abs(dt - safeMedian) > safeMedian * 0.45) {
+      irregularCount++;
+    }
+    if (dt > safeMedian * 1.75) {
+      droppedSamplesEstimate += Math.max(1, Math.round(dt / safeMedian) - 1);
+    }
+  }
+
+  const stdDtMs = Math.sqrt(sqDiffSum / dts.length);
+  const jitterCv = meanDtMs > 0 ? stdDtMs / meanDtMs : 0;
+  const irregularIntervalFraction = irregularCount / dts.length;
+
+  const hasIrregularSampling =
+    droppedSamplesEstimate >= 2 ||
+    maxDtMs > safeMedian * 2.5 ||
+    irregularIntervalFraction > 0.12 ||
+    jitterCv > 0.25;
+
+  return {
+    actualSampleRateHz,
+    spanSec: spanMs / 1000,
+    medianDtMs,
+    meanDtMs,
+    minDtMs,
+    maxDtMs,
+    jitterCv,
+    droppedSamplesEstimate,
+    irregularIntervalFraction,
+    hasIrregularSampling,
+  };
 }
 
 /**
- * Computes buffering progress toward the initial fast spectrum window
- * (128 samples ≈ 2.1 s on 60 Hz browsers, 1024 samples ≈ 2.5 s at 411 Hz).
+ * Computes buffering progress toward the exact user-selected FFT sample count.
  */
 export function computeBufferProgress(
   samples: VibrationSample[],
-  sensorSource: string
+  targetSampleCount: FftSampleCount,
+  sensorSource: string,
+  isStalled = false
 ): BufferProgress {
-  const estimatedRateHz = estimateSampleRateHz(samples);
-  const target =
-    estimatedRateHz !== null && estimatedRateHz < 280
-      ? BROWSER_MIN_WINDOW_SAMPLES
-      : PHYPHOX_FFT_SAMPLES;
+  const intervalStats = analyzeTimestampIntervals(samples);
+  const elapsedSec =
+    samples.length >= 2
+      ? Math.max(0, (samples[samples.length - 1].timestamp - samples[0].timestamp) / 1000)
+      : 0;
 
   return {
-    collected: Math.min(samples.length, target),
-    target,
-    estimatedRateHz,
+    collected: Math.min(samples.length, targetSampleCount),
+    target: targetSampleCount,
+    estimatedRateHz: intervalStats ? intervalStats.actualSampleRateHz : null,
+    elapsedSec,
+    isStalled,
+    irregularDuringFill: intervalStats ? intervalStats.hasIrregularSampling : false,
+    droppedDuringFill: intervalStats ? intervalStats.droppedSamplesEstimate : 0,
     sensorSource,
   };
 }
 
 /**
- * Adaptive Phyphox-style FFT frame:
- * - At 400+ Hz: uses full 1024 real samples (2.49 s period, 0.40 Hz resolution, 206 Hz Nyquist).
- * - At ~60 Hz browser limit: starts at 128 real samples (2.1 s) and steps cleanly to 256 (4.3 s),
- *   zero-padded to 1024 FFT points for razor-sharp peak localization without 17s stalls.
+ * Computes an exact N-sample single-axis FFT frame matching Phyphox Acceleration Spectrum
+ * methodology, strictly using only `axis` and strictly stopping at `nyquistHz`.
+ * Returns `null` if fewer than `sampleCount` samples have been acquired (incomplete buffer).
  */
 export function computeLiveSpectrumFrame(
   samples: VibrationSample[],
   axis: SensorAxis,
-  sensorSource: string
+  sampleCount: FftSampleCount,
+  sensorSource: string,
+  isStalled = false,
+  recentTopPeaks: number[] = []
 ): LiveSpectrumFrame | null {
-  const estRate = estimateSampleRateHz(samples);
-  const nReal = pickRealWindowSize(samples.length, estRate);
-  if (nReal === 0) return null;
+  if (samples.length < sampleCount) return null;
 
-  const fftSize = PHYPHOX_FFT_SAMPLES;
-  const slice = samples.slice(samples.length - nReal);
-  const spanSec = (slice[nReal - 1].timestamp - slice[0].timestamp) / 1000;
-  if (spanSec <= 0.1) return null;
+  const singleAxis = normalizeSingleAxis(axis);
+  const slice = samples.slice(samples.length - sampleCount);
+  const stats = analyzeTimestampIntervals(slice);
+  if (!stats) return null;
 
-  const dtSec = spanSec / (nReal - 1);
-  const sampleRateHz = 1 / dtSec;
-  if (!Number.isFinite(sampleRateHz) || sampleRateHz < 10) return null;
+  const sampleRateHz = stats.actualSampleRateHz;
+  const dtSec = 1 / sampleRateHz;
+  const periodSec = sampleCount * dtSec;
+  // Requirement 5: Frequency Resolution = Actual Sampling Rate / Number of FFT Samples
+  const resolutionHz = sampleRateHz / sampleCount;
+  const nyquistHz = sampleRateHz / 2;
 
-  const periodSec = nReal * dtSec;
-  const resolutionHz = 1 / periodSec;
-  const nyquistHz = 0.5 / dtSec;
-  const displayStepHz = sampleRateHz / fftSize;
-  const numBins = fftSize / 2 + 1;
-
-  let amps: Float64Array;
-  if (axis === 'triaxial') {
-    const vx = new Float64Array(nReal);
-    const vy = new Float64Array(nReal);
-    const vz = new Float64Array(nReal);
-    for (let i = 0; i < nReal; i++) {
-      vx[i] = slice[i].x;
-      vy[i] = slice[i].y;
-      vz[i] = slice[i].z;
-    }
-    const mx = computeSingleAxisMagnitudes(vx, nReal, fftSize);
-    const my = computeSingleAxisMagnitudes(vy, nReal, fftSize);
-    const mz = computeSingleAxisMagnitudes(vz, nReal, fftSize);
-    amps = new Float64Array(numBins);
-    for (let k = 0; k < numBins; k++) {
-      amps[k] = Math.hypot(mx[k], my[k], mz[k]);
-    }
-  } else {
-    const v = new Float64Array(nReal);
-    for (let i = 0; i < nReal; i++) {
-      v[i] = slice[i][axis];
-    }
-    amps = computeSingleAxisMagnitudes(v, nReal, fftSize);
+  const channelValues = new Float64Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    channelValues[i] = slice[i][singleAxis];
   }
 
+  const mags = computeSingleAxisOneSidedSpectrum(channelValues, sampleCount);
+  const numBins = mags.length; // sampleCount / 2 + 1
   const frequenciesHz = new Array<number>(numBins);
-  const amplitudesAU = new Array<number>(numBins);
+  const amplitudesMs2 = new Array<number>(numBins);
+
+  const activeMags: number[] = [];
+  let maxPeak = 0;
 
   for (let k = 0; k < numBins; k++) {
-    const freq = k * displayStepHz;
+    const freq = k * resolutionHz;
     frequenciesHz[k] = freq;
-    amplitudesAU[k] = freq < MIN_SPECTRUM_HZ ? 0 : amps[k];
+    const val = freq < MIN_VALID_SPECTRUM_HZ ? 0 : mags[k];
+    amplitudesMs2[k] = val;
+    if (freq >= MIN_VALID_SPECTRUM_HZ) {
+      activeMags.push(val);
+      if (val > maxPeak) maxPeak = val;
+    }
   }
+
+  // Noise & stability evaluation
+  let snrRatio = 0;
+  if (activeMags.length > 0) {
+    const sortedMags = [...activeMags].sort((a, b) => a - b);
+    const medianNoise = Math.max(1e-6, sortedMags[Math.floor(sortedMags.length / 2)]);
+    snrRatio = maxPeak / medianNoise;
+  }
+
+  let peakStabilityCv = 0;
+  if (recentTopPeaks.length >= 3) {
+    const allPeaks = [...recentTopPeaks.slice(-5), maxPeak];
+    const meanP = allPeaks.reduce((s, v) => s + v, 0) / allPeaks.length;
+    if (meanP > 1e-6) {
+      const varP =
+        allPeaks.reduce((s, v) => s + (v - meanP) * (v - meanP), 0) / allPeaks.length;
+      peakStabilityCv = Math.sqrt(varP) / meanP;
+    }
+  }
+
+  const isNoisyOrUnstable =
+    (maxPeak > 0.02 && snrRatio < 2.2) || peakStabilityCv > 0.35;
+
+  const quality: AcquisitionQuality = {
+    actualSampleRateHz: stats.actualSampleRateHz,
+    medianDtMs: stats.medianDtMs,
+    meanDtMs: stats.meanDtMs,
+    minDtMs: stats.minDtMs,
+    maxDtMs: stats.maxDtMs,
+    jitterCv: stats.jitterCv,
+    droppedSamplesEstimate: stats.droppedSamplesEstimate,
+    irregularIntervalFraction: stats.irregularIntervalFraction,
+    hasIrregularSampling: stats.hasIrregularSampling,
+    isStalled,
+    isNoisyOrUnstable,
+    snrRatio,
+    peakStabilityCv,
+  };
 
   return {
     frequenciesHz,
-    amplitudesAU,
+    amplitudesMs2,
+    amplitudesAU: amplitudesMs2,
     sampleRateHz,
     nyquistHz,
     resolutionHz,
     periodSec,
-    fftSize,
-    windowSamples: nReal,
+    fftSize: sampleCount,
+    windowSamples: sampleCount,
     sensorSource,
-    axisUsed: axis,
+    axisUsed: singleAxis,
     updatedAt: performance.now(),
+    quality,
   };
 }
 
 /**
- * Maintains an unbiased, low-variance spectrum measurement using an exponential RMS filter
- * across settled frames of matching window size (never Peak-Hold max() latching).
+ * Converts a valid N-sample FFT frame directly into a SpectrumMeasurement without
+ * distortion or peak-hold latching so all 4 balancing runs share identical amplitude scaling.
  */
 export function updateSpectrumMeasurement(
   prev: SpectrumMeasurement | null,
   frame: LiveSpectrumFrame
 ): SpectrumMeasurement {
-  const numBins = frame.frequenciesHz.length;
-  const canAverageWithPrev =
+  const sameConfig =
     prev !== null &&
-    prev.amplitudesAU.length === numBins &&
     prev.samplesUsed === frame.windowSamples &&
     prev.axisUsed === frame.axisUsed &&
     Math.abs(prev.sampleRateHz - frame.sampleRateHz) < Math.max(4, frame.sampleRateHz * 0.15);
 
-  const alpha = 0.32;
-  const amplitudesAU = new Array<number>(numBins);
-
-  for (let k = 0; k < numBins; k++) {
-    const liveVal = frame.amplitudesAU[k];
-    if (canAverageWithPrev && prev) {
-      const prevVal = prev.amplitudesAU[k] ?? liveVal;
-      amplitudesAU[k] = Math.sqrt((1 - alpha) * prevVal * prevVal + alpha * liveVal * liveVal);
-    } else {
-      amplitudesAU[k] = liveVal;
-    }
-  }
-
   return {
     frequenciesHz: frame.frequenciesHz,
-    amplitudesAU,
-    liveAmplitudesAU: frame.amplitudesAU,
+    amplitudesMs2: frame.amplitudesMs2,
+    amplitudesAU: frame.amplitudesMs2,
+    liveAmplitudesAU: frame.amplitudesMs2,
     sampleRateHz: frame.sampleRateHz,
     nyquistHz: frame.nyquistHz,
     resolutionHz: frame.resolutionHz,
@@ -275,15 +355,100 @@ export function updateSpectrumMeasurement(
     fftSize: frame.fftSize,
     sensorSource: frame.sensorSource,
     axisUsed: frame.axisUsed,
-    frameCount: canAverageWithPrev && prev ? prev.frameCount + 1 : 1,
+    frameCount: sameConfig && prev ? prev.frameCount + 1 : 1,
+    quality: frame.quality,
+  };
+}
+
+export interface PeakPickReadout {
+  binIdx: number;
+  frequencyHz: number;
+  amplitudeMs2: number;
+  isInterpolated: boolean;
+  isWithinValidRange: boolean;
+}
+
+/**
+ * Computes the user-controlled Peak Pick readout at `binIdx`.
+ * - Nearest Bin mode: exact bin frequency and amplitude.
+ * - Interpolated mode: 3-point parabolic refinement around the user's selected bin/local crest (+/- 1 bin),
+ *   never jumping away to a different spectral peak.
+ */
+export function computePeakPickReadout(
+  spectrum: SpectrumMeasurement,
+  binIdx: number,
+  useInterpolation: boolean
+): PeakPickReadout | null {
+  const nBins = spectrum.frequenciesHz.length;
+  if (nBins < 3 || binIdx < 0 || binIdx >= nBins) return null;
+
+  const baseFreq = spectrum.frequenciesHz[binIdx];
+  const baseAmp = spectrum.amplitudesMs2[binIdx] ?? 0;
+
+  if (!useInterpolation || binIdx <= 1 || binIdx >= nBins - 2) {
+    return {
+      binIdx,
+      frequencyHz: baseFreq,
+      amplitudeMs2: baseAmp,
+      isInterpolated: false,
+      isWithinValidRange:
+        baseFreq >= MIN_VALID_SPECTRUM_HZ && baseFreq <= spectrum.nyquistHz + 1e-6,
+    };
+  }
+
+  // Only inspect immediate 3-bin neighborhood [binIdx-1, binIdx, binIdx+1] around user cursor
+  let centerIdx = binIdx;
+  const aL = spectrum.amplitudesMs2[binIdx - 1] ?? 0;
+  const aC = spectrum.amplitudesMs2[binIdx] ?? 0;
+  const aR = spectrum.amplitudesMs2[binIdx + 1] ?? 0;
+  if (aL > aC && aL >= aR && binIdx - 1 > 1) centerIdx = binIdx - 1;
+  else if (aR > aC && aR > aL && binIdx + 1 < nBins - 1) centerIdx = binIdx + 1;
+
+  const y1 = spectrum.amplitudesMs2[centerIdx - 1] ?? 0;
+  const y2 = spectrum.amplitudesMs2[centerIdx] ?? 0;
+  const y3 = spectrum.amplitudesMs2[centerIdx + 1] ?? 0;
+
+  const denom = y1 - 2 * y2 + y3;
+  if (denom >= -1e-12 || !(y2 >= y1 && y2 >= y3)) {
+    const cf = spectrum.frequenciesHz[centerIdx];
+    const ca = spectrum.amplitudesMs2[centerIdx] ?? 0;
+    return {
+      binIdx: centerIdx,
+      frequencyHz: cf,
+      amplitudeMs2: ca,
+      isInterpolated: false,
+      isWithinValidRange:
+        cf >= MIN_VALID_SPECTRUM_HZ && cf <= spectrum.nyquistHz + 1e-6,
+    };
+  }
+
+  const rawDelta = (0.5 * (y1 - y3)) / denom;
+  const delta = Math.max(-0.5, Math.min(0.5, rawDelta));
+  const df =
+    spectrum.frequenciesHz.length > 1
+      ? spectrum.frequenciesHz[1] - spectrum.frequenciesHz[0]
+      : spectrum.resolutionHz;
+  const interpFreq = spectrum.frequenciesHz[centerIdx] + delta * df;
+  const interpAmp = Math.max(y2, y2 - 0.25 * (y1 - y3) * delta);
+
+  return {
+    binIdx: centerIdx,
+    frequencyHz: interpFreq,
+    amplitudeMs2: interpAmp,
+    isInterpolated: true,
+    isWithinValidRange:
+      interpFreq >= MIN_VALID_SPECTRUM_HZ && interpFreq <= spectrum.nyquistHz + 1e-6,
   };
 }
 
 /**
- * Parses an exported Phyphox FFT / Acceleration Spectrum CSV ("Frequency (Hz)","Absolute Amplitude (a.u.)")
- * supporting comma, semicolon, or tab delimiters and scientific notation.
+ * Parses an exported Phyphox FFT / Acceleration Spectrum CSV ("Frequency (Hz)","Absolute Amplitude")
+ * supporting comma, semicolon, or tab delimiters.
  */
-export function parsePhyphoxCsv(csvText: string): SpectrumMeasurement | null {
+export function parsePhyphoxCsv(
+  csvText: string,
+  axisUsed: SingleAxis = 'z'
+): SpectrumMeasurement | null {
   const lines = csvText
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -292,7 +457,6 @@ export function parsePhyphoxCsv(csvText: string): SpectrumMeasurement | null {
   const pairs: { f: number; a: number }[] = [];
 
   for (const line of lines) {
-    // Support comma, semicolon, or tab separation
     const sep = line.includes('\t') ? '\t' : line.includes(';') && !line.includes(',') ? ';' : ',';
     const parts = line.split(sep).map((p) => p.replace(/^["'\s]+|["'\s]+$/g, ''));
     if (parts.length < 2) continue;
@@ -318,22 +482,20 @@ export function parsePhyphoxCsv(csvText: string): SpectrumMeasurement | null {
   const df = diffs[Math.floor(diffs.length / 2)];
 
   const frequenciesHz: number[] = [];
-  const amplitudesAU: number[] = [];
+  const amplitudesMs2: number[] = [];
 
-  // Phyphox exports start at bin k=1 (df); prepend DC 0 Hz = 0 for clean plotting from origin
   if (pairs[0].f > df * 0.5) {
     frequenciesHz.push(0);
-    amplitudesAU.push(0);
+    amplitudesMs2.push(0);
   }
   for (const p of pairs) {
     frequenciesHz.push(p.f);
-    amplitudesAU.push(p.a);
+    amplitudesMs2.push(p.a);
   }
 
   const fLast = pairs[pairs.length - 1].f;
   const lastBinIndex = Math.round(fLast / df);
   const nextPow2 = Math.pow(2, Math.ceil(Math.log2(Math.max(2, lastBinIndex + 1))));
-  // Phyphox omits DC (k=0) and Nyquist (k=N/2); e.g. 63 bins => N/2 = 64 => Nyquist = 64 * df
   const nyquistHz = Math.abs(lastBinIndex + 1 - nextPow2) <= 1 ? nextPow2 * df : fLast;
   const sampleRateHz = 2 * nyquistHz;
   const resolutionHz = df;
@@ -342,8 +504,9 @@ export function parsePhyphoxCsv(csvText: string): SpectrumMeasurement | null {
 
   return {
     frequenciesHz,
-    amplitudesAU,
-    liveAmplitudesAU: amplitudesAU,
+    amplitudesMs2,
+    amplitudesAU: amplitudesMs2,
+    liveAmplitudesAU: amplitudesMs2,
     sampleRateHz,
     nyquistHz,
     resolutionHz,
@@ -351,9 +514,22 @@ export function parsePhyphoxCsv(csvText: string): SpectrumMeasurement | null {
     samplesUsed,
     fftSize: samplesUsed,
     sensorSource: 'Phyphox CSV',
-    axisUsed: 'triaxial',
+    axisUsed,
     frameCount: 1,
+    quality: {
+      actualSampleRateHz: sampleRateHz,
+      medianDtMs: 1000 / sampleRateHz,
+      meanDtMs: 1000 / sampleRateHz,
+      minDtMs: 1000 / sampleRateHz,
+      maxDtMs: 1000 / sampleRateHz,
+      jitterCv: 0,
+      droppedSamplesEstimate: 0,
+      irregularIntervalFraction: 0,
+      hasIrregularSampling: false,
+      isStalled: false,
+      isNoisyOrUnstable: false,
+      snrRatio: 10,
+      peakStabilityCv: 0,
+    },
   };
 }
-
-

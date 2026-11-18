@@ -1,14 +1,35 @@
-import { VibrationSample } from '../types/balancing';
+import { SingleAxis, VibrationSample } from '../types/balancing';
+
+export interface StreamDiagnostics {
+  isStalled: boolean;
+  streamElapsedMs: number;
+  lastSampleAgeMs: number;
+  noSamplesTimeout: boolean;
+}
 
 export interface LiveSensorCallbacks {
-  onSamplesBuffer?: (samples: VibrationSample[], sourceLabel: string) => void;
+  onSamplesBuffer?: (
+    samples: VibrationSample[],
+    sourceLabel: string,
+    diagnostics?: StreamDiagnostics
+  ) => void;
   onStatusChange?: (
     status: 'idle' | 'streaming' | 'error',
     message?: string
   ) => void;
 }
 
-const MAX_BUFFER_SAMPLES = 2048; // Holds strict 1024-sample FFT windows cleanly
+export interface StartStreamOptions {
+  axis?: SingleAxis;
+  simulationConfig?: {
+    runType: 'O' | 'O+T1' | 'O+T2' | 'O+T3';
+    baseRpm: number;
+  };
+}
+
+const MAX_BUFFER_SAMPLES = 4608; // Comfortably holds up to 4096-sample rolling FFT windows
+const NO_SAMPLES_TIMEOUT_MS = 2200;
+const STALL_GAP_MS = 1200;
 
 export class SensorManager {
   private isStreaming = false;
@@ -20,6 +41,8 @@ export class SensorManager {
   private emitTimer: number | null = null;
   private probeTimer: number | null = null;
   private simTimer: number | null = null;
+  private streamStartMs = 0;
+  private lastSamplePerfMs = 0;
 
   constructor(callbacks: LiveSensorCallbacks = {}) {
     this.callbacks = callbacks;
@@ -75,26 +98,32 @@ export class SensorManager {
   }
 
   /**
-   * Starts real-time accelerometer streaming into a rolling buffer and emits
-   * snapshots every 100 ms (~10 Hz, matching Phyphox analysis cadence).
+   * Starts real-time single-axis accelerometer streaming into a rolling buffer and emits
+   * snapshots every 100 ms.
    *
-   * On Android Chrome where Generic Sensor Accelerometer API exists, briefly probes
-   * both DeviceMotionEvent and Accelerometer (requesting highest allowed hardware rate)
-   * for 550ms and automatically keeps whichever delivers the higher real sample rate.
+   * Acquires exclusively from the selected accelerometer axis (`axis`).
+   * Requests the highest practical sampling rate supported by the browser/OS and briefly
+   * probes DeviceMotionEvent vs Generic Sensor Accelerometer API for 550 ms, selecting
+   * whichever yields more actual samples. Never assumes a fixed sampling rate.
    */
-  public startLiveStream(simulationConfig?: {
-    runType: 'O' | 'O+T1' | 'O+T2' | 'O+T3';
-    baseRpm: number;
-  }): void {
+  public startLiveStream(options?: StartStreamOptions): void {
     this.cleanupHardware();
 
     this.samples = [];
     this.isStreaming = true;
+    this.streamStartMs = performance.now();
+    this.lastSamplePerfMs = 0;
 
-    if (simulationConfig) {
+    const selectedAxis: SingleAxis = options?.axis ?? 'z';
+
+    if (options?.simulationConfig) {
       this.activeSource = 'Simulator (411 Hz)';
       this.callbacks.onStatusChange?.('streaming');
-      this.startSimulator(simulationConfig.runType, simulationConfig.baseRpm);
+      this.startSimulator(
+        options.simulationConfig.runType,
+        options.simulationConfig.baseRpm,
+        selectedAxis
+      );
       return;
     }
 
@@ -102,57 +131,72 @@ export class SensorManager {
       this.isStreaming = false;
       this.callbacks.onStatusChange?.(
         'error',
-        'No hardware accelerometer detected in this browser. Open on an Android/iOS smartphone over HTTPS, or enable Simulator Mode on Setup.'
+        'No hardware accelerometer detected in this browser. Open on an Android/iOS smartphone over HTTPS.'
       );
       return;
     }
 
     this.callbacks.onStatusChange?.('streaming');
 
-    // Separate probe buffers for the first 550ms so whichever API fires faster wins
     const dmBuffer: VibrationSample[] = [];
     const accelBuffer: VibrationSample[] = [];
     let settled = false;
+    let lastDmTs = 0;
     let lastAccelTs = 0;
 
-    const pushSample = (x: number, y: number, z: number, now: number) => {
-      this.samples.push({
-        timestamp: now,
-        x,
-        y,
-        z,
-        magnitude: Math.hypot(x, y, z),
-      });
+    const makeSingleAxisSample = (
+      timestamp: number,
+      value: number
+    ): VibrationSample => ({
+      timestamp,
+      x: selectedAxis === 'x' ? value : 0,
+      y: selectedAxis === 'y' ? value : 0,
+      z: selectedAxis === 'z' ? value : 0,
+      magnitude: 0, // Single-axis only: never compute 3-axis vector magnitude
+    });
+
+    const pushSample = (sample: VibrationSample) => {
+      this.samples.push(sample);
       if (this.samples.length > MAX_BUFFER_SAMPLES) {
         this.samples.splice(0, this.samples.length - MAX_BUFFER_SAMPLES);
       }
+      this.lastSamplePerfMs = performance.now();
     };
 
     const motionListener = (event: DeviceMotionEvent) => {
       if (!this.isStreaming) return;
       const raw = event.accelerationIncludingGravity;
       const lin = event.acceleration;
-      const hasRaw =
-        raw !== null &&
-        raw !== undefined &&
-        (typeof raw.x === 'number' || typeof raw.y === 'number' || typeof raw.z === 'number');
-      const acc = hasRaw ? raw : lin;
+      // Prefer raw accelerationIncludingGravity so OS high-pass filtering does not distort low-Hz balancing bands;
+      // static DC/gravity offset is subtracted cleanly in FFT processing.
+      const acc =
+        raw && typeof raw[selectedAxis] === 'number'
+          ? raw
+          : lin && typeof lin[selectedAxis] === 'number'
+          ? lin
+          : null;
       if (!acc) return;
 
-      const sample: VibrationSample = {
-        timestamp: performance.now(),
-        x: typeof acc.x === 'number' ? acc.x : 0,
-        y: typeof acc.y === 'number' ? acc.y : 0,
-        z: typeof acc.z === 'number' ? acc.z : 0,
-        magnitude: 0,
-      };
-      sample.magnitude = Math.hypot(sample.x, sample.y, sample.z);
+      const rawVal = acc[selectedAxis];
+      if (typeof rawVal !== 'number' || !Number.isFinite(rawVal)) return;
+
+      const perfNow = performance.now();
+      const evTs = event.timeStamp;
+      const useEvTs =
+        typeof evTs === 'number' &&
+        Number.isFinite(evTs) &&
+        evTs > lastDmTs &&
+        Math.abs(evTs - perfNow) < 2000;
+      const ts = useEvTs ? evTs : perfNow > lastDmTs ? perfNow : lastDmTs + 0.01;
+      lastDmTs = ts;
+
+      const sample = makeSingleAxisSample(ts, rawVal);
 
       if (!settled) {
         dmBuffer.push(sample);
-        pushSample(sample.x, sample.y, sample.z, sample.timestamp);
+        pushSample(sample);
       } else {
-        pushSample(sample.x, sample.y, sample.z, sample.timestamp);
+        pushSample(sample);
       }
     };
 
@@ -177,22 +221,27 @@ export class SensorManager {
         type AccelCtor = new (opts?: { frequency?: number }) => GenericAccel;
         const Ctor = (window as unknown as { Accelerometer: AccelCtor }).Accelerometer;
 
-        // Try 500 Hz first so sensors running at ~411 Hz are not capped below hardware max
-        try {
-          accelSensor = new Ctor({ frequency: 500 });
-        } catch {
+        // Request highest practical rate without assuming a fixed hardware rate
+        const rateCandidates = [1000, 500, 400, 200];
+        for (const freq of rateCandidates) {
           try {
-            accelSensor = new Ctor({ frequency: 400 });
+            accelSensor = new Ctor({ frequency: freq });
+            break;
           } catch {
-            accelSensor = new Ctor();
+            accelSensor = null;
           }
+        }
+        if (!accelSensor) {
+          accelSensor = new Ctor();
         }
 
         accelSensor.addEventListener('reading', () => {
           if (!this.isStreaming || !accelSensor) return;
+          const rawVal = accelSensor[selectedAxis];
+          if (typeof rawVal !== 'number' || !Number.isFinite(rawVal)) return;
+
           const perfNow = performance.now();
           const hwTs = accelSensor.timestamp;
-          // Prefer native hardware DOMHighResTimeStamp if valid, monotonic, and aligned with performance.now()
           const useHwTs =
             typeof hwTs === 'number' &&
             Number.isFinite(hwTs) &&
@@ -201,20 +250,13 @@ export class SensorManager {
           const now = useHwTs ? hwTs : perfNow > lastAccelTs ? perfNow : lastAccelTs + 0.01;
           lastAccelTs = now;
 
-          const x = accelSensor.x ?? 0;
-          const y = accelSensor.y ?? 0;
-          const z = accelSensor.z ?? 0;
+          const sample = makeSingleAxisSample(now, rawVal);
 
           if (!settled) {
-            accelBuffer.push({
-              timestamp: now,
-              x,
-              y,
-              z,
-              magnitude: Math.hypot(x, y, z),
-            });
+            accelBuffer.push(sample);
+            this.lastSamplePerfMs = perfNow;
           } else {
-            pushSample(x, y, z, now);
+            pushSample(sample);
           }
         });
 
@@ -238,13 +280,13 @@ export class SensorManager {
       settled = true;
     }
 
-    // Decide fastest stream at 550ms when Generic Sensor API is present
+    // Decide fastest actual stream after 550 ms probe
     if (!settled) {
       this.probeTimer = window.setTimeout(() => {
         if (!this.isStreaming) return;
         settled = true;
 
-        if (accelBuffer.length >= dmBuffer.length * 0.9 && accelBuffer.length >= 10) {
+        if (accelBuffer.length >= dmBuffer.length * 0.9 && accelBuffer.length >= 6) {
           if (this.motionHandler) {
             window.removeEventListener('devicemotion', this.motionHandler);
             this.motionHandler = null;
@@ -265,10 +307,24 @@ export class SensorManager {
       }, 550);
     }
 
-    // Emit live buffer updates every 100ms (10 Hz cadence matching Phyphox sleep="0.1")
     this.emitTimer = window.setInterval(() => {
       if (!this.isStreaming) return;
-      this.callbacks.onSamplesBuffer?.([...this.samples], this.activeSource);
+      const now = performance.now();
+      const elapsedMs = now - this.streamStartMs;
+      const lastSampleAgeMs =
+        this.lastSamplePerfMs > 0 ? now - this.lastSamplePerfMs : elapsedMs;
+      const noSamplesTimeout =
+        this.samples.length === 0 && elapsedMs > NO_SAMPLES_TIMEOUT_MS;
+      const isStalled =
+        noSamplesTimeout ||
+        (this.samples.length > 0 && lastSampleAgeMs > STALL_GAP_MS);
+
+      this.callbacks.onSamplesBuffer?.([...this.samples], this.activeSource, {
+        isStalled,
+        streamElapsedMs: elapsedMs,
+        lastSampleAgeMs,
+        noSamplesTimeout,
+      });
     }, 100);
   }
 
@@ -307,16 +363,16 @@ export class SensorManager {
 
   public clearSamples(): void {
     this.samples = [];
+    this.lastSamplePerfMs = 0;
   }
 
   /**
-   * Desktop / offline test signal generator (active ONLY when user enables Simulator Mode).
-   * Streams at 411 Hz (Nyquist 206 Hz, 1024 samples = 2.49 s, resolution 0.40 Hz)
-   * matching Phyphox hardware parameters.
+   * Optional desktop-testing generator (only invoked if Simulator Mode is explicitly enabled on Setup).
    */
   private startSimulator(
     runType: 'O' | 'O+T1' | 'O+T2' | 'O+T3',
-    baseRpm: number
+    baseRpm: number,
+    selectedAxis: SingleAxis
   ): void {
     const f1X = baseRpm > 0 ? baseRpm / 60 : 43;
     const fs = 411;
@@ -339,30 +395,32 @@ export class SensorManager {
       while (sampleIdx < targetIdx) {
         const tSec = (sampleIdx * dtMs) / 1000;
         const angle = 2 * Math.PI * f1X * tSec;
-        const modulation = 1 + 0.03 * Math.sin(tSec * 1.1);
         const sig =
-          amp * modulation * Math.sin(angle) +
+          amp * Math.sin(angle) +
           amp * 0.14 * Math.sin(2 * angle + 0.4) +
           (Math.random() - 0.5) * amp * 0.05;
 
-        const x = sig * 0.45;
-        const y = sig * 0.25;
-        const z = 9.81 + sig * 0.85;
-
+        const val = (selectedAxis === 'z' ? 9.81 : 0) + sig;
         this.samples.push({
           timestamp: startMs + sampleIdx * dtMs,
-          x,
-          y,
-          z,
-          magnitude: Math.hypot(x, y, z),
+          x: selectedAxis === 'x' ? val : 0,
+          y: selectedAxis === 'y' ? val : 0,
+          z: selectedAxis === 'z' ? val : 0,
+          magnitude: 0,
         });
         if (this.samples.length > MAX_BUFFER_SAMPLES) {
           this.samples.shift();
         }
+        this.lastSamplePerfMs = performance.now();
         sampleIdx++;
       }
 
-      this.callbacks.onSamplesBuffer?.([...this.samples], this.activeSource);
+      this.callbacks.onSamplesBuffer?.([...this.samples], this.activeSource, {
+        isStalled: false,
+        streamElapsedMs: elapsedMs,
+        lastSampleAgeMs: 0,
+        noSamplesTimeout: false,
+      });
     }, 100);
   }
 }
