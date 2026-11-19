@@ -131,7 +131,10 @@ export const MethodologyScreen: React.FC<Props> = ({
           Four-Run Dynamic Rotor Balancing
         </h1>
         <p className="text-sm text-slate-600 leading-relaxed">
-          Measure and record the original 1X unbalance amplitude (<strong>O</strong>) at a fixed radial measurement location. Next, place a trial weight at a constant radius from the shaft centerline and collect three additional amplitude readings (<strong>O+T1</strong>, <strong>O+T2</strong>, <strong>O+T3</strong>) with the trial weight installed at three angular positions separated by approximately 120&deg;. The resulting four measurements are plotted to determine the optimum correction weight and correction angle. Because the method relies on relative amplitude changes rather than calibrated vibration values, measurements may be entered in Arbitrary Units (AU). All readings should be taken at the same radial measurement location. <strong>CAUTION:</strong> This procedure only works if unbalance is the cause of the high vibration.
+          Measure and record the original 1X unbalance amplitude (<strong>O</strong>) at a fixed radial measurement location. Next, place a trial weight at a constant radius from the shaft centerline and collect three additional amplitude readings (<strong>O+T1</strong>, <strong>O+T2</strong>, <strong>O+T3</strong>) with the trial weight installed at three angular positions separated by approximately 120&deg;. The resulting four measurements are plotted to determine the optimum correction weight and correction angle. Because the method relies on relative amplitude changes rather than calibrated vibration values, measurements may be entered in Arbitrary Units (AU). All readings should be taken at the same radial measurement location. <strong>CAUTION:</strong> This procedure only works if unbalance is the cause of the high vibration.{' '}
+          <span className="text-red-600 font-medium">
+            NOTE: the existing data acquisition code is being worked on. For the four data acquisition measurements (pages 2 through 5), recommend using the Acceleration Spectrum found in the Phyphox mobile application. This should provide the user with the vibration amplitude at the running speed peak (use peak pick to select). Use the amplitude measurement to manually input the value on each page.
+          </span>
         </p>
       </div>
 
